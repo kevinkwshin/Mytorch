@@ -4,6 +4,13 @@
 - easy to train segmentation
 - support sweeps using wandb
 
+# INSTALL
+```
+git clone https://github.com/kevinkwshin/Mytorch/
+%cd Mytorch
+
+```
+
 # HOW TO USE 
 ## Training
 ```python 
