@@ -6,9 +6,12 @@
 
 # INSTALL
 ```
+# git clone
 git clone https://github.com/kevinkwshin/Mytorch/
 %cd Mytorch
-
+# install packages
+# !apt updates
+!pip install -r requirements.txt --user --upgrade #--quiet -U
 ```
 
 # HOW TO USE 
