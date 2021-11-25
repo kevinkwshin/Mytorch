@@ -14,6 +14,7 @@ import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, Dataset
+import kornia 
 
 import pytorch_lightning as pl
 
@@ -24,12 +25,15 @@ import utils
 import wandb
 import torchmetrics
 
+import multiprocessing
+# print(multiprocessing.cpu_count())
+
 import monai
 from monai.inferers import sliding_window_inference
 
 class SegModel(pl.LightningModule):
-    def __init__(self,  data_dir: str,
-                        project: str,
+    def __init__(self,  project: str,
+                        data_dir: str,
                         batch_size: int = 1,
                         data_module = 'dataset',
                         data_padsize= None,
@@ -40,40 +44,37 @@ class SegModel(pl.LightningModule):
                         gpus = -1,
                         lossfn = 'CELoss',
                         lr = 1e-3,
-                        net = 'unet',
+                        net_name = 'unet',
+                        net_norm = 'batch',
+                        net_encoder_name = 'resnet50',
                         net_inputch = 1,
                         net_outputch = 2,
-                        net_activation = 'relu',
-                        net_norm = 'batch',
-                        net_nnblock = False,
-                        net_rcnn = False,
-                        net_reconstruction = False,
-                        net_skipatt = False,
-                        net_supervision = False,
-                        net_wavelet = False,
+                        net_baysian=None,
                         net_ckpt = None,
                         precision = 32,
                         **kwargs):
                 
         super().__init__(**kwargs)
-        self.batch_size = batch_size
-        self.data_dir = data_dir
+#         self.batch_size = batch_size
+#         self.data_dir = data_dir
         self.data_module = data_module
         self.data_padsize = data_padsize
         self.data_cropsize = data_cropsize
         self.data_resize = data_resize
         self.data_patchsize = data_patchsize
-        self.net_ckpt = net_ckpt
+        self.net_name = net_name
         self.net_inputch = net_inputch
         self.net_outputch = net_outputch
+        self.net_encoder_name = net_encoder_name
+        self.net_baysian = net_baysian
         self.net_norm = net_norm
-        self.net_activation = net_activation
-        self.net_nnblock = net_nnblock
-        self.net_rcnn = net_rcnn
-        self.net_reconstruction = net_reconstruction
-        self.net_skipatt = net_skipatt
-        self.net_supervision = net_supervision
-        self.net_wavelet = net_wavelet
+#         self.net_activation = net_activation
+#         self.net_nnblock = net_nnblock
+#         self.net_rcnn = net_rcnn
+#         self.net_reconstruction = net_reconstruction
+#         self.net_skipatt = net_skipatt
+#         self.net_supervision = net_supervision
+#         self.net_wavelet = net_wavelet
         self.precision = precision
         self.project = project
         self.lr = lr
@@ -83,72 +84,186 @@ class SegModel(pl.LightningModule):
         self.lossfn = fn_call()
 
         # net
-        fn_call = getattr(nets, net)
+        fn_call = getattr(nets, net_name)
 #         try: 
-        self.net = fn_call(net_inputch=self.net_inputch, 
-                           net_outputch=self.net_outputch, 
-                           attention = self.net_skipatt,
-                           nnblock=self.net_nnblock, 
-                           rcnn = self.net_rcnn,
-                           reconstruction = self.net_reconstruction,
-                           supervision = self.net_supervision,
-                           wavelet = self.net_wavelet)
+#             self.net = fn_call(net_inputch=self.net_inputch, 
+#                                net_outputch=self.net_outputch, 
+#                                attention = self.net_skipatt,
+#                                nnblock=self.net_nnblock, 
+#                                rcnn = self.net_rcnn,
+#                                reconstruction = self.net_reconstruction,
+#                                supervision = self.net_supervision,
+#                                wavelet = self.net_wavelet)
 #         except:
-#             self.net = fn_call(net_inputch=self.net_inputch, net_outputch=self.net_outputch)
+        self.net = fn_call(net_inputch=self.net_inputch, net_outputch=self.net_outputch, encoder_name = self.net_encoder_name, baysian = self.net_baysian)
             
         if self.net_norm == 'instance':
             self.net = nets.bn2instance(self.net)
-            print('net_norms were replaced to instance normalizations')
         elif self.net_norm == 'group':
             self.net = nets.bn2group(self.net)
-            print('net_norms were replaced to group normalizations')           
       
-        if self.net_activation == 'leakyrelu':
-            self.net = nets.relu2lrelu(self.net)
-        elif self.net_activation == 'gelu':
-            self.net = nets.relu2gelu(self.net)
-        
+#         if self.net_activation == 'leakyrelu':
+#             self.net = nets.relu2lrelu(self.net)
+#         elif self.net_activation == 'gelu':
+#             self.net = nets.relu2gelu(self.net)
+                    
         # metric
-        self.metric = torchmetrics.F1(num_classes = self.net_outputch) if self.net_outputch>1 else torchmetrics.F1(num_classes = 2)
-        
+        self.metric = metric = monai.metrics.DiceMetric(include_background=False, reduction='mean_channel', get_not_nans=False)
+    
     def forward(self, x):
         return self.net(x)
     
     def training_step(self, batch, batch_idx):
-        x,y  = batch['x'], batch['y']
+        x,y,mask = batch['x'], batch['y'], batch['mask']
 
         yhat = self(x)
         if isinstance(yhat,tuple):
-            yhat, yhat_reconstruction = yhat
-            loss_reconstruction = F.mse_loss(yhat_reconstruction,y)
-        yhat = utils.Activation(yhat)
-        loss = self.lossfn(yhat, y)
-        try:
-            loss = loss + loss_reconstruction
-        except:
-            pass
-        try:
-            if yhat.shape[1] > 1:
-                # multi-class
-                metric = self.metric(torch.argmax(yhat,1).cpu().int().flatten(),y.cpu().int().flatten())
-            else:
-                # single-class
-                metric = self.metric(yhat.round().cpu().int().flatten(),y.cpu().int().flatten())
-        except:
-            metric = torch.tensor([0]).cuda()
+            yhat, xhat = yhat
+            xhat = F.sigmoid(xhat)
+#             xhat = 1-xhat
+    
+#             loss_reconstruction = F.binary_cross_entropy_with_logits(xhat, x) 
+            loss_reconstruction = F.binary_cross_entropy(xhat, x) 
+            self.logger.experiment.log({'images_recon_train' : [wb_image(x, 'x'), wb_image(xhat, 'xhat')]})
 
-        self.log('loss', loss, prog_bar=True)
-        self.log('metric', metric, prog_bar=True)
-        self.logger.experiment.log({'segmentation_train' : wb_mask(x, yhat, y)})
-        self.logger.experiment.log({'image_train' : wb_image(x, yhat, y)})
+        def torch_delete(tensor, indices):
+            mask = torch.ones(len(tensor), dtype=torch.bool)
+            for idx in range(len(indices)):
+                if indices[idx] == 0:
+                    mask[idx] = False
+            return tensor[mask]
+        
+#         print('before',y.shape,yhat.shape)
+        y = torch_delete(y,mask)
+        yhat = torch_delete(yhat,mask)
+#         print('after',y.shape,yhat.shape)
+        
+        if len(y)>=1:
+#             yhat = utils.Activation(yhat)
+            self.logger.experiment.log({'segmentation_train' : wb_mask(x, yhat, y),})
+            try:
+                loss = self.lossfn(yhat, y) + loss_reconstruction
+            except:
+                loss = self.lossfn(yhat, y)                
+        else:
+            loss = loss_reconstruction
+    
+        self.log('loss', loss)
         return {'loss': loss}
     
 
     def validation_step(self, batch, batch_idx):
-        x,y  = batch['x'], batch['y']
+        x,y,mask = batch['x'], batch['y'], batch['mask']
         
 #         yhat = self(x) # changed to sliding window method
-        def predictor(x,return_idx=0): # in case of prediction is type of list
+        def predictor(x, return_idx=0): # in case of prediction is type of list
+            result = self.net(x)
+            if isinstance(result, list) or isinstance(result, tuple):
+                return result[return_idx]
+            else:
+                return result
+
+        roi_size = int(self.data_patchsize) if len(self.data_patchsize.split('_'))==1 else (int(self.data_patchsize.split('_')[0]),int(self.data_patchsize.split('_')[1]))
+        yhat = sliding_window_inference(inputs=x, roi_size=roi_size, sw_batch_size=4, predictor=predictor, overlap=0.75, mode='constant')
+#         yhat = utils.Activation(yhat)
+        loss = self.lossfn(yhat, y)     
+        
+        if 'Rec' in self.net_name:
+            def predictor(x, return_idx=1): # in case of prediction is type of list
+                result = self.net(x)
+                if isinstance(result, list) or isinstance(result, tuple):
+                    return result[return_idx]
+                else:
+                    return result
+                
+            xhat = sliding_window_inference(inputs=x, roi_size=roi_size, sw_batch_size=4, predictor=predictor, overlap=0.75, mode='constant')
+            xhat = F.sigmoid(xhat)
+#             xhat = 1-xhat
+            
+#             loss_reconstruction = F.mse_loss(xhat, x)
+            loss_reconstruction = F.binary_cross_entropy(xhat, x) 
+            self.logger.experiment.log({'images_recon_val' : [wb_image(x, 'x'), wb_image(xhat, 'xhat')]})
+            loss = loss + loss_reconstruction
+
+        if yhat.shape[1] > 1:
+            # multi-class
+            yhat_temp = monai.networks.utils.one_hot(torch.argmax(yhat,1).unsqueeze(1), num_classes=self.net_outputch)
+            y_temp = monai.networks.utils.one_hot(y, num_classes=self.net_outputch)
+
+            metric = self.metric(yhat_temp,y_temp)[0][-1]
+        else:
+            # single-class
+            metric = self.metric(yhat.round(),y)[0][-1]
+            
+        self.log('loss_val', loss, prog_bar=True)
+        self.log('metric_val', metric)
+        self.logger.experiment.log({'segmentation_val' : wb_mask(x, yhat, y),})
+#                   'images_val' : [wb_image(x, 'x'), wb_image(y, 'y'), wb_image(yhat, 'yhat')]})
+    
+        return {'loss_val': loss}    
+
+    def test_step(self, batch, batch_idx):
+        x,y,mask = batch['x'], batch['y'], batch['mask']
+        
+#         yhat = self(x) # changed to sliding window method
+        def predictor(x, return_idx=0): # in case of prediction is type of list
+            result = self.net(x)
+            if isinstance(result, list) or isinstance(result, tuple):
+                return result[return_idx]
+            else:
+                return result
+
+        roi_size = int(self.data_patchsize) if len(self.data_patchsize.split('_'))==1 else (int(self.data_patchsize.split('_')[0]),int(self.data_patchsize.split('_')[1]))
+        yhat = sliding_window_inference(inputs=x, roi_size=roi_size, sw_batch_size=4, predictor=predictor, overlap=0.75, mode='constant')
+#         yhat = utils.Activation(yhat)
+        loss = self.lossfn(yhat, y)     
+        
+        if 'Rec' in self.net_name:
+            def predictor(x, return_idx=1): # in case of prediction is type of list
+                result = self.net(x)
+                if isinstance(result, list) or isinstance(result, tuple):
+                    return result[return_idx]
+                else:
+                    return result
+                
+            xhat = sliding_window_inference(inputs=x, roi_size=roi_size, sw_batch_size=4, predictor=predictor, overlap=0.75, mode='constant')
+            xhat = F.sigmoid(xhat)
+#             xhat = F.sigmoid(1-xhat)
+                
+#             loss_reconstruction = F.mse_loss(xhat, x)
+            loss_reconstruction = F.binary_cross_entropy(xhat, x) 
+            loss = loss + loss_reconstruction
+
+        if yhat.shape[1] > 1:
+            # multi-class
+            yhat_temp = monai.networks.utils.one_hot(torch.argmax(yhat,1).unsqueeze(1), num_classes=self.net_outputch)
+            y_temp = monai.networks.utils.one_hot(y, num_classes=self.net_outputch)
+
+            metric = self.metric(yhat_temp,y_temp)[0][-1]
+        else:
+            # single-class
+            metric = self.metric(yhat.round(),y)[0][-1]
+        return {'loss_test': loss, 'metric_test':metric, 'yhat':yhat}    
+    
+    def test_epoch_end(self, outputs):
+        metrics = list()
+        yhats = list()
+        
+        for output in outputs:
+            yhat = output['yhat']
+            metric = output['metric_test']
+            metrics.append(metric)
+        
+        yhats = torch.tensor(yhats)
+        metrics = torch.tensor(metrics)
+        print('metric_mean:', torch.mean(metrics))
+    
+    def predict_step(self, batch, batch_idx, dataloader_idx):
+        
+        x,y = batch['x'], batch['y']
+        
+#         yhat = self(x) # changed to sliding window method
+        def predictor(x, return_idx=0): # in case of prediction is type of list
             result = self.net(x)
             if isinstance(result, list) or isinstance(result, tuple):
                 return result[return_idx]
@@ -157,35 +272,20 @@ class SegModel(pl.LightningModule):
 
         roi_size = int(self.data_patchsize) if len(self.data_patchsize.split('_'))==1 else (int(self.data_patchsize.split('_')[0]),int(self.data_patchsize.split('_')[1]))
         yhat = sliding_window_inference(inputs=x, roi_size=roi_size, sw_batch_size=4, predictor=predictor, overlap=0.5, mode='constant')
-        yhat = utils.Activation(yhat)
-        loss = self.lossfn(yhat, y)        
-        try:
-            if yhat.shape[1] > 1:
-                # multi-class
-                metric = self.metric(torch.argmax(yhat,1).cpu().int().flatten(),y.cpu().int().flatten())
-            else:
-                # single-class
-                metric = self.metric(yhat.round().cpu().int().flatten(),y.cpu().int().flatten())
-        except:
-            metric = torch.tensor([0]).cuda()
-
-        self.log('loss_val', loss, prog_bar=True)
-        self.log('metric_val', metric, prog_bar=True)
-        self.logger.experiment.log({'segmentation_val' : wb_mask(x, yhat, y)})
-        self.logger.experiment.log({'image_val' : wb_image(x, yhat, y)})
-        return {'loss_val': loss}    
-
+#         yhat = utils.Activation(yhat)
+        
+        return {'x':x,'y':y,'yhat':yhat}
+        
+    
     def configure_optimizers(self):
         """
         mode : lr is given --> Adam with lr with given lr
         mode : lr is not given --> CosineAnnealingWarmup (default), SGD with varying lr
         """
-        if self.lr != 0:
-            optimizer = torch.optim.Adam(self.net.parameters(), lr=self.lr)
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.8, patience=20, min_lr=1e-6)    
-        else:
-            optimizer = torch.optim.SGD(self.net.parameters(), lr=1e-7, weight_decay = 0.0005, momentum=0.9)
-            scheduler = utils.CosineAnnealingWarmUpRestarts(optimizer, T_0=100, T_mult=1, eta_max=0.01, T_up=10, gamma=0.8)
+        
+        optimizer = torch.optim.Adam(self.net.parameters(), lr=self.lr)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.9, patience=10, min_lr=5e-6)
+        
         return {'optimizer': optimizer,
                 'lr_scheduler': {'scheduler': scheduler,
                                  'monitor': 'loss_val'}
@@ -213,18 +313,20 @@ class SegModel(pl.LightningModule):
         parser.add_argument("--data_patchsize", type=str2bool, default=None, help="input like this (height_width) : pad - crop - resize - patch: recommand (A * 2^n)")
         parser.add_argument("--batch_size", type=int, default=None, help="batch_size, if None, searching will be done")
         parser.add_argument("--lossfn", type=str2bool, default='CE', help="class of the loss function[CELoss, DiceCELoss, MSE, ...], see losses.py")
-        parser.add_argument("--net", type=str2bool, default='unet_eb5_batch', help="Class of the Networks, see nets.py")
+        parser.add_argument("--net_name", type=str2bool, default='smp_unet', help="Class of the Networks, see nets.py")
         parser.add_argument("--net_inputch", type=int, default=1, help='dimensions of network input channel')
-        parser.add_argument("--net_outputch", type=int, default=2, help='dimensions of network output channel')          
+        parser.add_argument("--net_outputch", type=int, default=2, help='dimensions of network output channel')
+        parser.add_argument("--net_baysian", type=str2bool, default=False, help='Dropout in the Bottleneck')
         parser.add_argument("--net_norm", type=str2bool, default='batch', help='net normalization, [batch,instance,group]')          
         parser.add_argument("--net_ckpt", type=str2bool, default=None, help='path to checkpoint, ex) logs/[PROJECT]/[ID]')        
-        parser.add_argument("--net_nnblock", type=str2bool, default=False, help='nnblock')              
-        parser.add_argument("--net_supervision", type=str2bool, default=False, help='supervision')      
-        parser.add_argument("--net_skipatt", type=str2bool, default=False, help='supervision')          
-        parser.add_argument("--net_rcnn", type=str2bool, default=False, help='supervision')      
-        parser.add_argument("--net_reconstruction", type=str2bool, default=False, help='supervision')      
-        parser.add_argument("--net_wavelet", type=str2bool, default=False, help='supervision')        
-        parser.add_argument("--net_activation", type=str2bool, default='relu', help='activation')        
+#         parser.add_argument("--net_nnblock", type=str2bool, default=False, help='nnblock')              
+#         parser.add_argument("--net_supervision", type=str2bool, default=False, help='supervision')      
+#         parser.add_argument("--net_skipatt", type=str2bool, default=False, help='supervision')          
+#         parser.add_argument("--net_rcnn", type=str2bool, default=False, help='supervision')      
+#         parser.add_argument("--net_reconstruction", type=str2bool, default=False, help='supervision')      
+#         parser.add_argument("--net_wavelet", type=str2bool, default=False, help='supervision')        
+#         parser.add_argument("--net_activation", type=str2bool, default='relu', help='activation')     
+        parser.add_argument("--net_encoder_name", type=str, default='resnet50', help='encoder__name')
         parser.add_argument("--precision", type=int, default=32, help='amp will be set when 16 is given')
         parser.add_argument("--lr", type=float, default=1e-3, help="Set learning rate of Adam optimzer.")        
         parser.add_argument("--experiment_name", type=str, default=None, help='Postfix name of experiment')         
@@ -239,7 +341,7 @@ class MyDataModule(pl.LightningDataModule):
                        data_cropsize= None, 
                        data_resize= None, 
                        data_patchsize = None, 
-                       num_workers: int = 4):
+                       num_workers: int = int(multiprocessing.cpu_count()/8)):
 
         super().__init__()
         self.data_dir = data_dir
@@ -260,8 +362,8 @@ class MyDataModule(pl.LightningDataModule):
                                                                                  data_cropsize = self.data_cropsize,
                                                                                  data_resize = self.data_resize,
                                                                                  data_patchsize = self.data_patchsize,), 
-#                                 transform=datasets.augmentation_train(),
-                                transform=datasets.augmentation_valid(),
+                                transform=datasets.augmentation_train(),
+#                                 transform=datasets.augmentation_valid(),
                                 adaptive_hist_range= False)
         
         self.validset = fn_call(self.data_dir, 
@@ -281,13 +383,13 @@ class MyDataModule(pl.LightningDataModule):
                                 adaptive_hist_range= False)
         
     def train_dataloader(self):
-        return DataLoader(self.trainset, batch_size=self.batch_size, num_workers=self.num_workers)
+        return DataLoader(self.trainset, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=True)
 
     def val_dataloader(self):
-        return DataLoader(self.validset, batch_size=self.batch_size)
+        return DataLoader(self.validset, batch_size=self.batch_size, num_workers=2)
 
     def test_dataloader(self):
-        return DataLoader(self.test, batch_size=self.batch_size)
+        return DataLoader(self.testset, batch_size=self.batch_size)
 
 
 # wandb image visualization
@@ -299,7 +401,7 @@ def labels():
         l[i] = label
     return l
 
-def wb_mask(x, yhat, y, samples=2):
+def wb_mask(x, yhat, y, samples=4):
     
     x = torchvision.utils.make_grid(x[:samples].cpu().detach(),normalize=True).permute(1,2,0)
     y = torchvision.utils.make_grid(y[:samples].cpu().detach()).permute(1,2,0)
@@ -314,16 +416,24 @@ def wb_mask(x, yhat, y, samples=2):
     "prediction" : {"mask_data" : yhat, "class_labels" : labels()},
     "ground truth" : {"mask_data" : y, "class_labels" : labels()}})
 
-def wb_image(x, yhat, y, samples=2):
-    
-    x = torchvision.utils.make_grid(x[:samples].cpu().detach(),normalize=True).permute(1,2,0)
-    y = torchvision.utils.make_grid(y[:samples].cpu().detach(),normalize=True).permute(1,2,0)
-    yhat = utils.Activation(yhat)
-    yhat = torchvision.utils.make_grid(yhat[:samples].cpu().detach()).permute(1,2,0)
+def wb_image(x, caption, samples=4):
+    if x.shape[1] != 1 and x.shape[1] !=3:
+        x = torch.argmax(x,1).unsqueeze(1)
+    if x.max() <= 1:
+        x = (x*255).long()
+    else:
+        if len(torch.unique(x))<5 and x.max()<10:
+            scale = 255//x.max()
+            x = (x*scale).long()
+    try:
+        x = torchvision.utils.make_grid(x[:samples].cpu().detach(),normalize=True).permute(1,2,0)
+    except:
+        x = torchvision.utils.make_grid(x[:samples].cpu().detach()).permute(1,2,0)
+
     x = x.numpy()
-    y = y.numpy()
-    yhat = yhat.numpy()
-    return wandb.Image(np.concatenate([x,y,yhat]), caption="Upper(x) Mid(y) Lower(yhat)")
+    x = x.astype(np.uint16)
+        
+    return wandb.Image(x, caption = caption)
 
 def main(args: Namespace):
     # ------------------------
@@ -343,23 +453,20 @@ def main(args: Namespace):
     from pytorch_lightning import loggers as pl_loggers
     from pytorch_lightning.callbacks import ModelCheckpoint,LearningRateMonitor, StochasticWeightAveraging, LambdaCallback, EarlyStopping
     
-    args.experiment_name = "Dataset{}_Net{}_Netnorm{}_Netinputch{}_Netoutputch{}_Loss{}_Lr{}_Precision{}_Patchsize{}_Prefix{}_"\
-    .format(args.data_dir.split('/')[-1], args.net, args.net_norm, args.net_inputch, args.net_outputch, args.lossfn, args.lr, args.precision,args.data_patchsize,args.experiment_name)
+    args.experiment_name = "Dataset{}_Net{}_NetEncoder{}_Loss{}_Precision{}_Patchsize{}_Prefix{}_"\
+    .format(args.data_dir.split('/')[-1], args.net_name, args.net_encoder_name, args.lossfn, args.precision, args.data_patchsize, args.experiment_name)
     print('Current Experiment:',args.experiment_name,'\n','*'*100)
     
     os.makedirs('logs',mode=0o777, exist_ok=True)
     wb_logger = pl_loggers.WandbLogger(save_dir='logs/', name=args.experiment_name, project=args.project, log_model = "all")
     wb_logger.log_hyperparams(args)
-    wb_logger.watch(model,log="all", log_freq=10)
-        
+#     wb_logger.watch(model,log="all", log_freq=10)
     Checkpoint_callback = ModelCheckpoint(verbose=True, 
                                           monitor='loss_val',
                                           mode='min',
-#                                           monitor='metric_val',
-#                                           mode='max',
                                           filename='{epoch:04d}-{loss_val:.4f}-{metric_val:.4f}',
-                                          save_top_k=3,)
-    
+                                          save_top_k=1,)
+
     # ------------------------
     # 3 INIT TRAINER
     # ------------------------
@@ -376,7 +483,7 @@ def main(args: Namespace):
                                             logger = wb_logger,
                                             log_every_n_steps=1,
                                             max_epochs = 2000,
-                                            num_processes = 4,
+                                            num_processes = 0,
                                             stochastic_weight_avg = True,
                                             sync_batchnorm = True,
                                             weights_summary = 'top', 
@@ -398,5 +505,4 @@ if __name__ == '__main__':
     args = parser.parse_args()
     print('args:',args,'\n')
     
-    main(args)
-    
+    main(args) 

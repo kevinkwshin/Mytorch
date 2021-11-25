@@ -1,91 +1,77 @@
-program: train.py
-project: Retina
 method: bayes
 metric:
-  goal: maximize
-  name: metric_val
+  goal: minimize
+  name: Wall Time
 parameters:
-  project:
+  batch_size:
     distribution: categorical
     values:
-    - Retina
-  data_dir:
-    distribution: categorical
-    values:
-    - /workspace/Retina/dataset/DRIVE
-    - /workspace/Retina/dataset/AMC/refined
-  data_module:
-    distribution: categorical
-    values:
-    - dataset
-    - dataset_adaptivehist
-  experiment_name:
-    distribution: categorical
-    values:
-    - None
-  lossfn:
-    distribution: categorical
-    values:
-#     - BoundaryCELoss
-#     - BoundaryFocalLoss
-    - FocalLoss
-    - CELoss
-  net:
-    distribution: categorical
-    values:
-    - waveletunet_r2att
-    - waveletunet_r2
-    - waveletunet_att    
-  net_norm:
-    distribution: categorical
-    values:
-    - batch
-    - instance
-    - group    
-  net_inputch:
-    distribution: categorical
-    values:
-    - 3
-  net_outputch:
-    distribution: categorical
-    values:
-    - 3
-  net_nnblock:
-    distribution: categorical
-    values:
-    - True
-    - False
-  net_supervision:
-    distribution: categorical
-    values:
-    - True
-    - False
-  data_padsize:
-    distribution: categorical
-    values:
-    - None
+    - 24
+    - 12
+    - 8
+    - 4
   data_cropsize:
     distribution: categorical
     values:
     - None
-  data_resize:
+  data_dir:
+    distribution: categorical
+    values:
+    - DRIVE2CH
+  data_module:
+    distribution: categorical
+    values:
+    - dataset_CLAHE
+    - dataset_ACLAHE
+    - dataset_CE
+  data_padsize:
     distribution: categorical
     values:
     - None
   data_patchsize:
     distribution: categorical
     values:
-    - 160
-    - 128
+    - 224224
+    - 256256
+    - 320320
+    - 384384
+  lossfn:
+    distribution: categorical
+    values:
+    - skel_FocalLoss
+    - CELoss
+    - DiceCELoss
+  net_baysian:
+    distribution: categorical
+    values:
+    - "true"
+    - "false"
+  net_encoder_name:
+    distribution: categorical
+    values:
+    - se_resnet152
+    - densenet161
+    - timm-regnety_160
+    - resnet50
+  net_name:
+    distribution: categorical
+    values:
+    - smp_unet
+    - smp_unetRecHard
+    - smp_unetRecSoft
+  net_norm:
+    distribution: categorical
+    values:
+    - batch
+    - group
+    - instance
   precision:
     distribution: categorical
     values:
+    - 32
     - 16
-  batch_size:
+  project:
     distribution: categorical
     values:
-    - 24
-  lr:
-    distribution: categorical
-    values:
-    - 1e-3
+    - Retina
+program: train.py

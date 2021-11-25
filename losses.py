@@ -8,6 +8,7 @@ from monai.networks.utils import one_hot
 import skimage
 import skimage.morphology
 import pylab as plt
+import utils
 
 def torch_dilation(tensor,theta0=1):
     '''
@@ -99,11 +100,13 @@ def skel_iweight(tensor):
 class skel_FocalLoss(nn.Module):
     def __init__(self):
         super(skel_FocalLoss, self).__init__()
-        self.ce = monai.losses.FocalLoss(to_onehot_y = True, gamma = 4.0)
+        self.ce = monai.losses.FocalLoss(to_onehot_y = True, gamma = 2.0)
         self.dice = monai.losses.GeneralizedDiceLoss(to_onehot_y=True, softmax=False)
-#         self.dice = monai.losses.TverskyLoss(to_onehot_y=True, alpha= 0.7, softmax=False)
+#         self.dice = monai.losses.TverskyLoss(to_onehot_y=True, alpha= 0.8, softmax=False)
         
     def forward(self,yhat,y):
+        yhat = utils.Activation(yhat)
+
         loss_ce = self.ce(yhat,y)
         loss_dice = self.dice(yhat,y)
         
@@ -119,18 +122,29 @@ class skel_FocalLoss(nn.Module):
 class FocalLoss(nn.Module):
     def __init__(self):
         super(FocalLoss, self).__init__()
-        self.ce = monai.losses.FocalLoss(to_onehot_y = True, gamma = 2.0)
+        self.ce = monai.losses.FocalLoss(to_onehot_y = True, gamma = 4.0)
+        
+    def forward(self,yhat,y):
+        yhat = utils.Activation(yhat)
+        loss = self.ce(yhat,y)
+        return loss 
+    
+class BCELoss(nn.Module):
+    def __init__(self):
+        super(BCELoss, self).__init__()
+        self.ce = nn.BCEWithLogitsLoss()
         
     def forward(self,yhat,y):
         loss = self.ce(yhat,y)
         return loss 
-    
+
 class CELoss(nn.Module):
     def __init__(self):
         super(CELoss, self).__init__()
         self.ce = nn.CrossEntropyLoss()
         
     def forward(self,yhat,y):
+        yhat = utils.Activation(yhat)
         y = y[:,0].long()
         loss = self.ce(yhat,y)
         return loss 
@@ -139,9 +153,10 @@ class DiceCELoss(nn.Module):
     def __init__(self):        
         super(DiceCELoss, self).__init__()
         self.dice = monai.losses.GeneralizedDiceLoss(to_onehot_y=True, softmax=False)
-        self.ce = CrossEntropyLoss()        
+        self.ce = CELoss()        
         
     def forward(self,yhat,y):
+        yhat = utils.Activation(yhat)
         dice = self.dice(yhat,y)
         ce = self.ce(yhat,y)
         return dice+ce
@@ -195,6 +210,7 @@ class BoundaryCELoss(nn.Module):
         self.boundary = BoundaryLoss()
 
     def forward(self,yhat,y):
+        yhat = utils.Activation(yhat)
         ce = self.ce(yhat,y) 
         boundary = self.boundary(yhat,y)        
         return ce+boundary
@@ -204,11 +220,42 @@ class BoundaryFocalLoss(nn.Module):
         super(BoundaryFocalLoss, self).__init__()
         self.ce = monai.losses.FocalLoss(to_onehot_y = True, gamma = 2.0)
         self.boundary = BoundaryLoss()
+        self.dice = monai.losses.GeneralizedDiceLoss(to_onehot_y=True, softmax=False)
+#         self.dice = monai.losses.TverskyLoss(to_onehot_y=True, alpha= 0.8, softmax=False)
 
     def forward(self,yhat,y):
+        yhat = utils.Activation(yhat)
         ce = self.ce(yhat,y) 
-        boundary = self.boundary(yhat,y)        
-        return ce+boundary
+        boundary = self.boundary(yhat,y)
+        dice =  self.dice(yhat,y)
+        
+        kernel = torch.ones(3,3).cuda()
+        yhat_skel = kornia.morphology.dilation(torch_skeleton(yhat),kernel)
+        y_skel = kornia.morphology.dilation(torch_skeleton(y),kernel)
+        
+        dice_skel = self.dice(yhat_skel,y_skel)
+        return ce+boundary#+dice_skel+dice
+    
+class BoundaryFocalSkelDiceLoss(nn.Module):
+    def __init__(self):        
+        super(BoundaryFocalSkelDiceLoss, self).__init__()
+        self.ce = monai.losses.FocalLoss(to_onehot_y = True, gamma = 2.0)
+        self.boundary = BoundaryLoss()
+        self.dice = monai.losses.GeneralizedDiceLoss(to_onehot_y=True, softmax=False)
+#         self.dice = monai.losses.TverskyLoss(to_onehot_y=True, alpha= 0.8, softmax=False)
+
+    def forward(self,yhat,y):
+        yhat = utils.Activation(yhat)
+        ce = self.ce(yhat,y) 
+        boundary = self.boundary(yhat,y)
+#         dice =  self.dice(yhat,y)
+        
+        kernel = torch.ones(3,3).cuda()
+        yhat_skel = kornia.morphology.dilation(torch_skeleton(yhat),kernel)
+        y_skel = kornia.morphology.dilation(torch_skeleton(y),kernel)
+        
+        dice_skel = self.dice(yhat_skel,y_skel)
+        return ce+boundary+dice_skel#+dice
 
 class BoundaryLoss(nn.Module):
     """Boundary Loss proposed in:
@@ -217,7 +264,7 @@ class BoundaryLoss(nn.Module):
     """
 #     def __init__(self, theta0=3, theta=3, alpha = 0.7, gamma = 0.75): #DRIVE
 #     def __init__(self, theta0=3, theta=15, alpha = 0.7, gamma = 0.75):  #AMC 이거로도 잘되었음
-    def __init__(self, theta0=3, theta=7, alpha = 0.7, gamma = 0.75):
+    def __init__(self, theta0=3, theta=15, alpha = 0.7, gamma = 0.75):
         super().__init__()
 
         self.alpha = alpha
@@ -231,7 +278,7 @@ class BoundaryLoss(nn.Module):
             - pred: the output from model (before softmax)
                     shape (N, C, H, W)
             - gt: ground truth map
-                    shape (N, H, w)
+                    shape (N, 1, H, w)
         Return:
             - boundary loss, averaged over mini-batch
         """
@@ -288,17 +335,6 @@ class BoundaryLoss(nn.Module):
 #         loss = torch.mean(1 - BF1)
         loss = torch.mean(torch.pow(1 - BF1, self.gamma))
         
-# #         my impliment (only for 2 class?? 0하고 1일때만 가능... need check nan)      
-#         # Precision, Recall
-#         TP = torch.sum(pred_b * gt_b, dim=2) 
-#         TN = torch.sum(pred_b_ext * gt_b_ext, dim=2)
-#         FN = torch.sum(pred_b_ext * gt_b, dim=2)
-#         FP = torch.sum(pred_b * gt_b_ext, dim=2)
-#         ALL = TP+TN+FN+FP + smooth
-        
-#         TV = (TP/ALL)/(TP/ALL + self.alpha*FN/ALL + (1-self.alpha)*FP/ALL + smooth)
-#         loss = torch.mean(torch.pow(1 - TV, self.gamma))
-
         return loss
 
 
