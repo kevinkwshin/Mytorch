@@ -2,7 +2,7 @@ natsort
 ujson
 requests
 urllib3
-torch = 1.8
+torch == 1.8.1
 torchvision
 numpy
 six

@@ -98,15 +98,15 @@ def skel_iweight(tensor):
 #         return loss + loss_iw
 
 class skel_FocalLoss(nn.Module):
-    def __init__(self):
+    def __init__(self, activation_T=1):
         super(skel_FocalLoss, self).__init__()
         self.ce = monai.losses.FocalLoss(to_onehot_y = True, gamma = 2.0)
         self.dice = monai.losses.GeneralizedDiceLoss(to_onehot_y=True, softmax=False)
+        self.activation_T = activation_T
 #         self.dice = monai.losses.TverskyLoss(to_onehot_y=True, alpha= 0.8, softmax=False)
         
     def forward(self,yhat,y):
-        yhat = utils.Activation(yhat)
-
+        yhat = utils.Activation(yhat, self.activation_T)
         loss_ce = self.ce(yhat,y)
         loss_dice = self.dice(yhat,y)
         
@@ -120,43 +120,48 @@ class skel_FocalLoss(nn.Module):
 
     
 class FocalLoss(nn.Module):
-    def __init__(self):
+    def __init__(self, activation_T=1):
         super(FocalLoss, self).__init__()
+        self.activation_T = activation_T
         self.ce = monai.losses.FocalLoss(to_onehot_y = True, gamma = 4.0)
         
     def forward(self,yhat,y):
-        yhat = utils.Activation(yhat)
+        yhat = utils.Activation(yhat,self.activation_T)
         loss = self.ce(yhat,y)
         return loss 
     
 class BCELoss(nn.Module):
-    def __init__(self):
+    def __init__(self, activation_T=1):
         super(BCELoss, self).__init__()
-        self.ce = nn.BCEWithLogitsLoss()
+        self.activation_T = activation_T
+        self.ce = nn.BCELoss()
         
     def forward(self,yhat,y):
+        yhat = utils.Activation(yhat,self.activation_T)
         loss = self.ce(yhat,y)
         return loss 
 
 class CELoss(nn.Module):
-    def __init__(self):
+    def __init__(self, activation_T=1):
         super(CELoss, self).__init__()
+        self.activation_T = activation_T
         self.ce = nn.CrossEntropyLoss()
         
     def forward(self,yhat,y):
-        yhat = utils.Activation(yhat)
+        yhat = utils.Activation(yhat,self.activation_T)
         y = y[:,0].long()
         loss = self.ce(yhat,y)
         return loss 
 
 class DiceCELoss(nn.Module):
-    def __init__(self):        
+    def __init__(self, activation_T=1):
         super(DiceCELoss, self).__init__()
+        self.activation_T = activation_T
         self.dice = monai.losses.GeneralizedDiceLoss(to_onehot_y=True, softmax=False)
         self.ce = CELoss()        
         
     def forward(self,yhat,y):
-        yhat = utils.Activation(yhat)
+        yhat = utils.Activation(yhat,self.activation_T)
         dice = self.dice(yhat,y)
         ce = self.ce(yhat,y)
         return dice+ce
@@ -204,27 +209,29 @@ class ReconLoss(nn.Module):
         return MSELoss+L1Loss
 
 class BoundaryCELoss(nn.Module):
-    def __init__(self):        
+    def __init__(self,activation_T=1):        
         super(BoundaryCELoss, self).__init__()
+        self.activation_T = activation_T
         self.ce = CELoss()
         self.boundary = BoundaryLoss()
 
     def forward(self,yhat,y):
-        yhat = utils.Activation(yhat)
+        yhat = utils.Activation(yhat,self.activation_T)
         ce = self.ce(yhat,y) 
         boundary = self.boundary(yhat,y)        
         return ce+boundary
 
 class BoundaryFocalLoss(nn.Module):
-    def __init__(self):        
+    def __init__(self,activation_T=1):        
         super(BoundaryFocalLoss, self).__init__()
+        self.activation_T = activation_T
         self.ce = monai.losses.FocalLoss(to_onehot_y = True, gamma = 2.0)
         self.boundary = BoundaryLoss()
         self.dice = monai.losses.GeneralizedDiceLoss(to_onehot_y=True, softmax=False)
 #         self.dice = monai.losses.TverskyLoss(to_onehot_y=True, alpha= 0.8, softmax=False)
 
     def forward(self,yhat,y):
-        yhat = utils.Activation(yhat)
+        yhat = utils.Activation(yhat,self.activation_T)
         ce = self.ce(yhat,y) 
         boundary = self.boundary(yhat,y)
         dice =  self.dice(yhat,y)
@@ -237,15 +244,16 @@ class BoundaryFocalLoss(nn.Module):
         return ce+boundary#+dice_skel+dice
     
 class BoundaryFocalSkelDiceLoss(nn.Module):
-    def __init__(self):        
+    def __init__(self,activation_T=1):        
         super(BoundaryFocalSkelDiceLoss, self).__init__()
+        self.activation_T = activation_T
         self.ce = monai.losses.FocalLoss(to_onehot_y = True, gamma = 2.0)
         self.boundary = BoundaryLoss()
         self.dice = monai.losses.GeneralizedDiceLoss(to_onehot_y=True, softmax=False)
 #         self.dice = monai.losses.TverskyLoss(to_onehot_y=True, alpha= 0.8, softmax=False)
 
     def forward(self,yhat,y):
-        yhat = utils.Activation(yhat)
+        yhat = utils.Activation(yhat,self.activation_T)
         ce = self.ce(yhat,y) 
         boundary = self.boundary(yhat,y)
 #         dice =  self.dice(yhat,y)

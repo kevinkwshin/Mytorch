@@ -28,6 +28,544 @@ import segmentation_models_pytorch as smp
 #     print('initialize network with %s' % init_type)
 #     net.apply(init_func)
 
+
+import torch.nn as nn
+
+from typing import Optional, Sequence, Union
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from monai.networks.blocks import Convolution, UpSample
+from monai.networks.layers.factories import Conv, Pool
+from monai.utils import deprecated_arg, ensure_tuple_rep
+
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+class NLBlockND(nn.Module):
+    def __init__(self, in_channels, inter_channels=None, mode='embedded', 
+                 dimension=3, bn_layer=True):
+        """Implementation of Non-Local Block with 4 different pairwise functions but doesn't include subsampling trick
+        args:
+            in_channels: original channel size (1024 in the paper)
+            inter_channels: channel size inside the block if not specifed reduced to half (512 in the paper)
+            mode: supports Gaussian, Embedded Gaussian, Dot Product, and Concatenation
+            dimension: can be 1 (temporal), 2 (spatial), 3 (spatiotemporal)
+            bn_layer: whether to add batch norm
+        """
+        super(NLBlockND, self).__init__()
+
+        assert dimension in [1, 2, 3]
+        
+        if mode not in ['gaussian', 'embedded', 'dot', 'concatenate']:
+            raise ValueError('`mode` must be one of `gaussian`, `embedded`, `dot` or `concatenate`')
+            
+        self.mode = mode
+        self.dimension = dimension
+
+        self.in_channels = in_channels
+        self.inter_channels = inter_channels
+
+        # the channel size is reduced to half inside the block
+        if self.inter_channels is None:
+            self.inter_channels = in_channels // 2
+            if self.inter_channels == 0:
+                self.inter_channels = 1
+        
+        # assign appropriate convolutional, max pool, and batch norm layers for different dimensions
+        if dimension == 3:
+            conv_nd = nn.Conv3d
+            max_pool_layer = nn.MaxPool3d(kernel_size=(1, 2, 2))
+            bn = nn.BatchNorm3d
+        elif dimension == 2:
+            conv_nd = nn.Conv2d
+            max_pool_layer = nn.MaxPool2d(kernel_size=(2, 2))
+            bn = nn.BatchNorm2d
+        else:
+            conv_nd = nn.Conv1d
+            max_pool_layer = nn.MaxPool1d(kernel_size=(2))
+            bn = nn.BatchNorm1d
+
+        # function g in the paper which goes through conv. with kernel size 1
+        self.g = conv_nd(in_channels=self.in_channels, out_channels=self.inter_channels, kernel_size=1)
+
+        # add BatchNorm layer after the last conv layer
+        if bn_layer:
+            self.W_z = nn.Sequential(
+                    conv_nd(in_channels=self.inter_channels, out_channels=self.in_channels, kernel_size=1),
+                    bn(self.in_channels)
+                )
+            # from section 4.1 of the paper, initializing params of BN ensures that the initial state of non-local block is identity mapping
+            nn.init.constant_(self.W_z[1].weight, 0)
+            nn.init.constant_(self.W_z[1].bias, 0)
+        else:
+            self.W_z = conv_nd(in_channels=self.inter_channels, out_channels=self.in_channels, kernel_size=1)
+
+            # from section 3.3 of the paper by initializing Wz to 0, this block can be inserted to any existing architecture
+            nn.init.constant_(self.W_z.weight, 0)
+            nn.init.constant_(self.W_z.bias, 0)
+
+        # define theta and phi for all operations except gaussian
+        if self.mode == "embedded" or self.mode == "dot" or self.mode == "concatenate":
+            self.theta = conv_nd(in_channels=self.in_channels, out_channels=self.inter_channels, kernel_size=1)
+            self.phi = conv_nd(in_channels=self.in_channels, out_channels=self.inter_channels, kernel_size=1)
+        
+        if self.mode == "concatenate":
+            self.W_f = nn.Sequential(
+                    nn.Conv2d(in_channels=self.inter_channels * 2, out_channels=1, kernel_size=1),
+                    nn.ReLU()
+                )
+            
+    def forward(self, x):
+        """
+        args
+            x: (N, C, T, H, W) for dimension=3; (N, C, H, W) for dimension 2; (N, C, T) for dimension 1
+        """
+
+        batch_size = x.size(0)
+        
+        # (N, C, THW)
+        # this reshaping and permutation is from the spacetime_nonlocal function in the original Caffe2 implementation
+        g_x = self.g(x).view(batch_size, self.inter_channels, -1)
+        g_x = g_x.permute(0, 2, 1)
+
+        if self.mode == "gaussian":
+            theta_x = x.view(batch_size, self.in_channels, -1)
+            phi_x = x.view(batch_size, self.in_channels, -1)
+            theta_x = theta_x.permute(0, 2, 1)
+            f = torch.matmul(theta_x, phi_x)
+
+        elif self.mode == "embedded" or self.mode == "dot":
+            theta_x = self.theta(x).view(batch_size, self.inter_channels, -1)
+            phi_x = self.phi(x).view(batch_size, self.inter_channels, -1)
+            theta_x = theta_x.permute(0, 2, 1)
+            f = torch.matmul(theta_x, phi_x)
+
+        elif self.mode == "concatenate":
+            theta_x = self.theta(x).view(batch_size, self.inter_channels, -1, 1)
+            phi_x = self.phi(x).view(batch_size, self.inter_channels, 1, -1)
+            
+            h = theta_x.size(2)
+            w = phi_x.size(3)
+            theta_x = theta_x.repeat(1, 1, 1, w)
+            phi_x = phi_x.repeat(1, 1, h, 1)
+            
+            concat = torch.cat([theta_x, phi_x], dim=1)
+            f = self.W_f(concat)
+            f = f.view(f.size(0), f.size(2), f.size(3))
+        
+        if self.mode == "gaussian" or self.mode == "embedded":
+            f_div_C = F.softmax(f, dim=-1)
+        elif self.mode == "dot" or self.mode == "concatenate":
+            N = f.size(-1) # number of position in x
+            f_div_C = f / N
+        
+        y = torch.matmul(f_div_C, g_x)
+        
+        # contiguous here just allocates contiguous chunk of memory
+        y = y.permute(0, 2, 1).contiguous()
+        y = y.view(batch_size, self.inter_channels, *x.size()[2:])
+        
+        W_y = self.W_z(y)
+        # residual connection
+        z = W_y + x
+
+        return z
+
+
+# if __name__ == '__main__':
+#     import torch
+
+#     for bn_layer in [True, False]:
+#         img = torch.zeros(2, 3, 20)
+#         net = NLBlockND(in_channels=3, mode='concatenate', dimension=1, bn_layer=bn_layer)
+#         out = net(img)
+#         print(out.size())
+        
+class TwoConv(nn.Sequential):
+    """two convolutions."""
+
+    @deprecated_arg(name="dim", new_name="spatial_dims", since="0.6", msg_suffix="Please use `spatial_dims` instead.")
+    def __init__(
+        self,
+        spatial_dims: int,
+        in_chns: int,
+        out_chns: int,
+        act: Union[str, tuple],
+        norm: Union[str, tuple],
+        bias: bool,
+        dropout: Union[float, tuple] = 0.0,
+        dim: Optional[int] = None,
+    ):
+        """
+        Args:
+            spatial_dims: number of spatial dimensions.
+            in_chns: number of input channels.
+            out_chns: number of output channels.
+            act: activation type and arguments.
+            norm: feature normalization type and arguments.
+            bias: whether to have a bias term in convolution blocks.
+            dropout: dropout ratio. Defaults to no dropout.
+
+        .. deprecated:: 0.6.0
+            ``dim`` is deprecated, use ``spatial_dims`` instead.
+        """
+        super().__init__()
+
+        if dim is not None:
+            spatial_dims = dim
+        conv_0 = Convolution(spatial_dims, in_chns, out_chns, act=act, norm=norm, dropout=dropout, bias=bias, padding=1)
+        conv_1 = Convolution(spatial_dims, out_chns, out_chns, act=act, norm=norm, dropout=dropout, bias=bias, padding=1)
+        
+        self.add_module("conv_0", conv_0)
+        self.add_module("conv_1", conv_1)
+
+
+class Down(nn.Sequential):
+    """maxpooling downsampling and two convolutions."""
+
+    @deprecated_arg(name="dim", new_name="spatial_dims", since="0.6", msg_suffix="Please use `spatial_dims` instead.")
+    def __init__(
+        self,
+        spatial_dims: int,
+        in_chns: int,
+        out_chns: int,
+        act: Union[str, tuple],
+        norm: Union[str, tuple],
+        bias: bool,
+        dropout: Union[float, tuple] = 0.0,
+        dim: Optional[int] = None,
+    ):
+        """
+        Args:
+            spatial_dims: number of spatial dimensions.
+            in_chns: number of input channels.
+            out_chns: number of output channels.
+            act: activation type and arguments.
+            norm: feature normalization type and arguments.
+            bias: whether to have a bias term in convolution blocks.
+            dropout: dropout ratio. Defaults to no dropout.
+
+        .. deprecated:: 0.6.0
+            ``dim`` is deprecated, use ``spatial_dims`` instead.
+        """
+        super().__init__()
+        if dim is not None:
+            spatial_dims = dim
+        max_pooling = Pool["MAX", spatial_dims](kernel_size=2)
+        convs = TwoConv(spatial_dims, in_chns, out_chns, act, norm, bias, dropout)
+        self.add_module("max_pooling", max_pooling)
+        self.add_module("convs", convs)
+
+class UpCat(nn.Module):
+    """upsampling, concatenation with the encoder feature map, two convolutions"""
+
+    @deprecated_arg(name="dim", new_name="spatial_dims", since="0.6", msg_suffix="Please use `spatial_dims` instead.")
+    def __init__(
+        self,
+        spatial_dims: int,
+        in_chns: int,
+        cat_chns: int,
+        out_chns: int,
+        act: Union[str, tuple],
+        norm: Union[str, tuple],
+        bias: bool,
+        dropout: Union[float, tuple] = 0.0,
+        upsample: str = "deconv",
+        pre_conv: Optional[Union[nn.Module, str]] = "default",
+        interp_mode: str = "linear",
+        align_corners: Optional[bool] = True,
+        halves: bool = True,
+        dim: Optional[int] = None,
+    ):
+        """
+        Args:
+            spatial_dims: number of spatial dimensions.
+            in_chns: number of input channels to be upsampled.
+            cat_chns: number of channels from the decoder.
+            out_chns: number of output channels.
+            act: activation type and arguments.
+            norm: feature normalization type and arguments.
+            bias: whether to have a bias term in convolution blocks.
+            dropout: dropout ratio. Defaults to no dropout.
+            upsample: upsampling mode, available options are
+                ``"deconv"``, ``"pixelshuffle"``, ``"nontrainable"``.
+            pre_conv: a conv block applied before upsampling.
+                Only used in the "nontrainable" or "pixelshuffle" mode.
+            interp_mode: {``"nearest"``, ``"linear"``, ``"bilinear"``, ``"bicubic"``, ``"trilinear"``}
+                Only used in the "nontrainable" mode.
+            align_corners: set the align_corners parameter for upsample. Defaults to True.
+                Only used in the "nontrainable" mode.
+            halves: whether to halve the number of channels during upsampling.
+                This parameter does not work on ``nontrainable`` mode if ``pre_conv`` is `None`.
+
+        .. deprecated:: 0.6.0
+            ``dim`` is deprecated, use ``spatial_dims`` instead.
+        """
+        super().__init__()
+        if dim is not None:
+            spatial_dims = dim
+        if upsample == "nontrainable" and pre_conv is None:
+            up_chns = in_chns
+        else:
+            up_chns = in_chns // 2 if halves else in_chns
+        self.upsample = UpSample(
+            spatial_dims,
+            in_chns,
+            up_chns,
+            2,
+            mode=upsample,
+            pre_conv=pre_conv,
+            interp_mode=interp_mode,
+            align_corners=align_corners,
+        )
+        self.convs = TwoConv(spatial_dims, cat_chns + up_chns, out_chns, act, norm, bias, dropout)
+
+    def forward(self, x: torch.Tensor, x_e: Optional[torch.Tensor]):
+        """
+
+        Args:
+            x: features to be upsampled.
+            x_e: features from the encoder.
+        """
+        x_0 = self.upsample(x)
+
+        if x_e is not None:
+            # handling spatial shapes due to the 2x maxpooling with odd edge lengths.
+            dimensions = len(x.shape) - 2
+            sp = [0] * (dimensions * 2)
+            for i in range(dimensions):
+                if x_e.shape[-i - 1] != x_0.shape[-i - 1]:
+                    sp[i * 2 + 1] = 1
+            x_0 = torch.nn.functional.pad(x_0, sp, "replicate")
+            x = self.convs(torch.cat([x_e, x_0], dim=1))  # input channels: (cat_chns + up_chns)
+        else:
+            x = self.convs(x_0)
+
+        return x
+    
+class monai_unet(nn.Module):
+    def __init__(
+        self,
+        spatial_dims: int = 2,
+        net_inputch: int = 1,
+        net_outputch: int = 2,
+        net_bayesian = 0,
+        # features: Sequence[int] = (32, 32, 64, 128, 256, 32),
+        features: Sequence[int] = (32, 32, 64, 128, 256, 512, 32),
+        act: Union[str, tuple] = ("LeakyReLU", {"negative_slope": 0.1, "inplace": True}),
+        norm: Union[str, tuple] = ("group", {"num_groups": 8}),
+        bias: bool = True,
+        dropout: Union[float, tuple] = 0.0,
+        upsample: str = "deconv",
+        dimensions: Optional[int] = None,
+        bottleneck_channels = None,
+    ):
+        """
+        A UNet implementation with 1D/2D/3D supports.
+
+        Based on:
+
+            Falk et al. "U-Net – Deep Learning for Cell Counting, Detection, and
+            Morphometry". Nature Methods 16, 67–70 (2019), DOI:
+            http://dx.doi.org/10.1038/s41592-018-0261-2
+
+        Args:
+            spatial_dims: number of spatial dimensions. Defaults to 3 for spatial 3D inputs.
+            in_channels: number of input channels. Defaults to 1.
+            out_channels: number of output channels. Defaults to 2.
+            features: six integers as numbers of features.
+                Defaults to ``(32, 32, 64, 128, 256, 32)``,
+
+                - the first five values correspond to the five-level encoder feature sizes.
+                - the last value corresponds to the feature size after the last upsampling.
+
+            act: activation type and arguments. Defaults to LeakyReLU.
+            norm: feature normalization type and arguments. Defaults to instance norm.
+            bias: whether to have a bias term in convolution blocks. Defaults to True.
+                According to `Performance Tuning Guide <https://pytorch.org/tutorials/recipes/recipes/tuning_guide.html>`_,
+                if a conv layer is directly followed by a batch norm layer, bias should be False.
+            dropout: dropout ratio. Defaults to no dropout.
+            upsample: upsampling mode, available options are
+                ``"deconv"``, ``"pixelshuffle"``, ``"nontrainable"``.
+
+        .. deprecated:: 0.6.0
+            ``dimensions`` is deprecated, use ``spatial_dims`` instead.
+
+        Examples::
+
+            # for spatial 2D
+            >>> net = BasicUNet(spatial_dims=2, features=(64, 128, 256, 512, 1024, 128))
+
+            # for spatial 2D, with group norm
+            >>> net = BasicUNet(spatial_dims=2, features=(64, 128, 256, 512, 1024, 128), norm=("group", {"num_groups": 4}))
+
+            # for spatial 3D
+            >>> net = BasicUNet(spatial_dims=3, features=(32, 32, 64, 128, 256, 32))
+
+        See Also
+
+            - :py:class:`monai.networks.nets.DynUNet`
+            - :py:class:`monai.networks.nets.UNet`
+
+        """
+        super().__init__()
+        if dimensions is not None:
+            spatial_dims = dimensions
+
+        fea = ensure_tuple_rep(features, 7)
+        print(f"BasicUNet features: {fea}.")
+        in_channels = net_inputch
+        out_channels = net_outputch
+        
+        self.NLBlock_1 = NLBlockND(in_channels=fea[1], mode='dot', dimension=2)
+        self.NLBlock_2 = NLBlockND(in_channels=fea[2], mode='dot', dimension=2)
+        self.NLBlock_3 = NLBlockND(in_channels=fea[3], mode='dot', dimension=2)
+        self.NLBlock_4 = NLBlockND(in_channels=fea[4], mode='dot', dimension=2)
+        self.NLBlock_5 = NLBlockND(in_channels=fea[5], mode='dot', dimension=2)
+        
+        self.skipAtt = attention_block(F_g=fea[4],F_l=fea[4],F_int=fea[4])
+        self.conv_0 = TwoConv(spatial_dims, in_channels, features[0], act, norm, bias, dropout)
+        self.down_1 = Down(spatial_dims, fea[0], fea[1], act, norm, bias, dropout)
+        self.down_2 = Down(spatial_dims, fea[1], fea[2], act, norm, bias, dropout)
+        self.down_3 = Down(spatial_dims, fea[2], fea[3], act, norm, bias, dropout)
+        self.down_4 = Down(spatial_dims, fea[3], fea[4], act, norm, bias, dropout)
+        self.down_5 = Down(spatial_dims, fea[4], fea[5], act, norm, bias, dropout)
+
+        self.upcat_5 = UpCat(spatial_dims, fea[5], fea[4], fea[4], act, norm, bias, dropout, upsample)
+        self.upcat_4 = UpCat(spatial_dims, fea[4], fea[3], fea[3], act, norm, bias, dropout, upsample)
+        self.upcat_3 = UpCat(spatial_dims, fea[3], fea[2], fea[2], act, norm, bias, dropout, upsample)
+        self.upcat_2 = UpCat(spatial_dims, fea[2], fea[1], fea[1], act, norm, bias, dropout, upsample)
+        # self.upcat_1 = UpCat(spatial_dims, fea[1], fea[0], fea[5], act, norm, bias, dropout, upsample, halves=False)
+        self.upcat_1 = UpCat(spatial_dims, fea[1], fea[0], fea[6], act, norm, bias, dropout, upsample, halves=False)
+
+        # self.final_conv = Conv["conv", spatial_dims](fea[5], out_channels, kernel_size=1)
+        self.final_conv = Conv["conv", spatial_dims](fea[6], out_channels, kernel_size=1)
+        self.bottleneck_channels = bottleneck_channels 
+        
+        if self.bottleneck_channels is not None:
+            pool = nn.AdaptiveAvgPool1d(1)
+            flatten = nn.Flatten()
+            dropout = nn.Dropout(p=.2, inplace=True) if dropout else nn.Identity()
+            linear = nn.Linear(fea[5], regression_channels, bias=True)
+            activation = nn.Sigmoid() # nn.ReLU()
+            self.bottleneck_head = nn.Sequential(pool,flatten,dropout,linear,activation)
+    
+        if net_bayesian!=0:
+            self.MCDropout = MCDropout(p=net_bayesian)
+    
+    def forward(self, x: torch.Tensor):
+        """
+        Args:
+            x: input should have spatially N dimensions
+                ``(Batch, in_channels, dim_0[, dim_1, ..., dim_N])``, N is defined by `dimensions`.
+                It is recommended to have ``dim_n % 16 == 0`` to ensure all maxpooling inputs have
+                even edge lengths.
+
+        Returns:
+            A torch Tensor of "raw" predictions in shape
+            ``(Batch, out_channels, dim_0[, dim_1, ..., dim_N])``.
+        """
+        x0 = self.conv_0(x)
+
+        x1 = self.down_1(x0)
+        # x1 = self.NLBlock_1(x1)
+        
+        x2 = self.down_2(x1)
+        x2 = self.NLBlock_2(x2)
+        
+        x2 = self.MCDropout(x2)
+        x3 = self.down_3(x2)
+        x3 = self.NLBlock_3(x3)
+        
+        x3 = self.MCDropout(x3)
+        x4 = self.down_4(x3)
+        x4 = self.NLBlock_4(x4)
+        
+        x4 = self.MCDropout(x4)
+        x5 = self.down_5(x4)
+        x5 = self.NLBlock_5(x5)
+        
+        u5 = self.upcat_5(x5, x4)
+        u4 = self.upcat_4(u5, x3)
+        u4 = self.NLBlock_3(u4)
+        
+        u3 = self.upcat_3(u4, x2)
+        u3 = self.NLBlock_2(u3)
+        
+        u2 = self.upcat_2(u3, x1)
+        u1 = self.upcat_1(u2, x0)
+
+        x = self.final_conv(u1)
+        # x = F.sigmoid(x)
+        
+        if self.bottleneck_channels is None:
+            return x
+        else:
+            y = self.bottleneck_head(x4)            
+            return x, y
+
+class attention_block(nn.Module):
+    def __init__(self,F_g,F_l,F_int):
+        super(attention_block,self).__init__()
+        inplace= False
+
+        self.W_g = nn.Sequential(
+            nn.Conv2d(F_g, F_int, kernel_size=1,stride=1,padding=0,bias=True),
+            nn.BatchNorm2d(F_int)
+            )
+
+        self.W_x = nn.Sequential(
+            nn.Conv2d(F_l, F_int, kernel_size=1,stride=1,padding=0,bias=True),
+            nn.BatchNorm2d(F_int)
+        )
+
+        self.psi = nn.Sequential(
+            nn.Conv2d(F_int, 1, kernel_size=1,stride=1,padding=0,bias=True),
+            nn.BatchNorm2d(1),
+            nn.Sigmoid()
+        )
+        self.relu = nn.ReLU(inplace=inplace)
+        
+    def forward(self,g,x):
+        g1 = self.W_g(g)
+        x1 = self.W_x(x)
+        psi = self.relu(g1+x1)
+        psi = self.psi(psi)
+
+        return x*psi  
+    
+
+class MCDropout(nn.Dropout):
+    def forward(self, input):
+        return F.dropout(input, self.p, True, self.inplace)
+
+
+class monai_unetr(nn.Module):
+    def __init__(self, net_inputch=3, net_outputch=2, net_norm='batch', net_bayesian=0):
+        super(monai_unetr, self).__init__()        
+
+        self.net = monai.networks.nets.UNETR(
+        in_channels=net_inputch,
+        out_channels=net_outputch,
+        spatial_dims=2,
+        img_size=128,
+        feature_size=16,
+        hidden_size=768,
+        mlp_dim=3072,
+        num_heads=12,
+        pos_embed="conv",
+        norm_name="instance",
+        res_block=True,
+        dropout_rate=0.0)
+        
+    def forward(self,x):
+        return self.net(x)    
+
+
 def bn2instance(module):
     module_output = module
     if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
@@ -166,89 +704,88 @@ def relu2gelu(module):
 #     del module
 #     return module_output
 
-class smp_deeplabplus(nn.Module):
-    def __init__(self, encoder_name='resnet50', net_inputch=3, net_outputch=2, net_norm='batch', baysian=False):
-        super(smp_deeplabplus, self).__init__()        
-        self.net = smp.DeepLabV3Plus(encoder_name = encoder_name,
-                                    encoder_depth = 5,
-                                    encoder_weights = 'imagenet',
-                                    encoder_output_stride = 16,
-                                    decoder_channels = 256,
-                                    decoder_atrous_rates = (12, 24, 36),
-                                    in_channels = net_inputch,
-                                    classes= net_outputch,
-                                    activation = None,
-                                    upsampling = 4,
-                                    aux_params = None)
+# class smp_deeplabplus(nn.Module):
+#     def __init__(self, encoder_name='resnet50', net_inputch=3, net_outputch=2, net_norm='batch', bayesian=0):
+#         super(smp_deeplabplus, self).__init__()        
+#         self.net = smp.DeepLabV3Plus(encoder_name = encoder_name,
+#                                     encoder_depth = 5,
+#                                     encoder_weights = 'imagenet',
+#                                     encoder_output_stride = 16,
+#                                     decoder_channels = 256,
+#                                     decoder_atrous_rates = (12, 24, 36),
+#                                     in_channels = net_inputch,
+#                                     classes= net_outputch,
+#                                     activation = None,
+#                                     upsampling = 4,
+#                                     aux_params = None)
 
-        if net_norm=='group':
-            self.net = bn2group(self.net)
-        elif net_norm == 'instance':
-            self.net = bn2instance(self.net)
-        if baysian:
-            self.MCDropout = MCDropout()
+#         if net_norm=='group':
+#             self.net = bn2group(self.net)
+#         elif net_norm == 'instance':
+#             self.net = bn2instance(self.net)
+#         if bayesian != 0:
+#             self.MCDropout = MCDropout(bayesian)
 
-            if 'resne' in encoder_name or 'densenet' in encoder_name:
-                list(self.net.encoder.children())[-1][-1] = nn.Sequential(self.MCDropout,list(self.net.encoder.children())[-1][-1]) # bottleneck
-                print(list(self.net.encoder.children())[-1][-1])
-            elif 'efficientnet' in encoder_name:
-                self.net.encoder.bn2 =  nn.Sequential(self.MCDropout, self.net.encoder.bn2) # efficientnet
-                print(self.net.encoder.bn2)
-            elif 'regnet' in encoder_name:                
-                self.net.encoder.s4 = nn.Sequential(self.MCDropout,self.net.encoder.s4) # regnet
-#                 self.net.encoder.s4.b1 = nn.Sequential(self.MCDropout,self.net.encoder.s4.b1) # regnety
-                print(self.net.encoder.s4)
+#             if 'resne' in encoder_name or 'densenet' in encoder_name:
+#                 list(self.net.encoder.children())[-1][-1] = nn.Sequential(self.MCDropout,list(self.net.encoder.children())[-1][-1]) # bottleneck
+#                 print(list(self.net.encoder.children())[-1][-1])
+#             elif 'efficientnet' in encoder_name:
+#                 self.net.encoder.bn2 =  nn.Sequential(self.MCDropout, self.net.encoder.bn2) # efficientnet
+#                 print(self.net.encoder.bn2)
+#             elif 'regnet' in encoder_name:                
+#                 self.net.encoder.s4 = nn.Sequential(self.MCDropout,self.net.encoder.s4) # regnet
+# #                 self.net.encoder.s4.b1 = nn.Sequential(self.MCDropout,self.net.encoder.s4.b1) # regnety
+#                 print(self.net.encoder.s4)
                 
-    def forward(self,x):
-        return self.net(x)
+#     def forward(self,x):
+#         return self.net(x)
 
-class smp_manet(nn.Module):
-    def __init__(self, encoder_name='resnet50', net_inputch=3, net_outputch=2, net_norm='batch', baysian=False):
-        super(smp_manet, self).__init__()        
-        self.net = smp.MAnet(
-                        encoder_name=encoder_name,
-                        encoder_depth=5,
-                        encoder_weights='imagenet',
-                        decoder_use_batchnorm=True,
-                        decoder_channels=(256, 128, 64, 32, 16),
-                        decoder_pab_channels=64,
-                        in_channels=net_inputch, 
-                        classes=net_outputch,
-                        activation=None,
-                        aux_params=None)
+# class smp_manet(nn.Module):
+#     def __init__(self, net_encoder_name='resnet50', net_inputch=3, net_outputch=2, net_norm='batch', net_bayesian=0):
+#         super(smp_manet, self).__init__()        
+#         self.net = smp.MAnet(
+#                         encoder_name=net_encoder_name,
+#                         encoder_depth=5,
+#                         encoder_weights='imagenet',
+#                         decoder_use_batchnorm=True,
+#                         decoder_channels=(256, 128, 64, 32, 16),
+#                         decoder_pab_channels=64,
+#                         in_channels=net_inputch, 
+#                         classes=net_outputch,
+#                         activation=None,
+#                         aux_params=None)
         
-        if net_norm=='group':
-            self.net = bn2group(self.net)
-        elif net_norm == 'instance':
-            self.net = bn2instance(self.net)
-#         if nnblock:
-#             self.nnblock = self.conv1.out_channels
-        if baysian:
-            self.MCDropout = MCDropout()
+#         if net_norm=='group':
+#             self.net = bn2group(self.net)
+#         elif net_norm == 'instance':
+#             self.net = bn2instance(self.net)
+# #         if nnblock:
+# #             self.nnblock = self.conv1.out_channels
+#         if net_bayesian!=0:
+#             self.MCDropout = MCDropout(bayesian)
 
-            if 'resne' in encoder_name or 'densenet' in encoder_name:
-                list(self.net.encoder.children())[-1][-1] = nn.Sequential(self.MCDropout,list(self.net.encoder.children())[-1][-1]) # bottleneck
-                print(list(self.net.encoder.children())[-1][-1])
-            elif 'efficientnet' in encoder_name:
-                self.net.encoder.bn2 =  nn.Sequential(self.MCDropout, self.net.encoder.bn2) # efficientnet
-                print(self.net.encoder.bn2)
-            elif 'regnet' in encoder_name:                
-                self.net.encoder.s4 = nn.Sequential(self.MCDropout,self.net.encoder.s4) # regnet
-#                 self.net.encoder.s4.b1 = nn.Sequential(self.MCDropout,self.net.encoder.s4.b1) # regnety
-                print(self.net.encoder.s4)
-                
+#             if 'resne' in encoder_name or 'densenet' in net_encoder_name:
+#                 list(self.net.encoder.children())[-1][-1] = nn.Sequential(self.MCDropout,list(self.net.encoder.children())[-1][-1]) # bottleneck
+#                 print(list(self.net.encoder.children())[-1][-1])
+#             elif 'efficientnet' in encoder_name:
+#                 self.net.encoder.bn2 =  nn.Sequential(self.MCDropout, self.net.encoder.bn2) # efficientnet
+#                 print(self.net.encoder.bn2)
+#             elif 'regnet' in encoder_name:                
+#                 self.net.encoder.s4 = nn.Sequential(self.MCDropout,self.net.encoder.s4) # regnet
+# #                 self.net.encoder.s4.b1 = nn.Sequential(self.MCDropout,self.net.encoder.s4.b1) # regnety
+#                 print(self.net.encoder.s4)                
         
-    def forward(self,x):
-        return self.net(x)
+#     def forward(self,x):
+#         return self.net(x)
 
 class smp_unet(nn.Module):
-    def __init__(self, encoder_name='resnet50', net_inputch=3, net_outputch=2, net_norm='batch', baysian=False):
+    def __init__(self, net_encoder_name='resnet50', net_inputch=3, net_outputch=2, net_norm='batch', net_bayesian=0):
         super(smp_unet, self).__init__()        
         self.net_inputch = net_inputch
         self.net_outputch = net_outputch
         
         self.net = smp.Unet(
-                        encoder_name=encoder_name,
+                        encoder_name=net_encoder_name,
                         decoder_use_batchnorm = True,
                         decoder_attention_type ='scse',
                         encoder_weights='imagenet',
@@ -262,33 +799,73 @@ class smp_unet(nn.Module):
             self.net = bn2instance(self.net)
 #         if nnblock:
 #             self.conv1.out_channels
-#             self.nnblock = NONLocalBlock2D()
-        if baysian:
-            self.MCDropout = MCDropout()
-
-            if 'resne' in encoder_name or 'densenet' in encoder_name:
-                list(self.net.encoder.children())[-1][-1] = nn.Sequential(self.MCDropout,list(self.net.encoder.children())[-1][-1]) # bottleneck
-                print(list(self.net.encoder.children())[-1][-1])
-            elif 'efficientnet' in encoder_name:
+#             self.nnblock = NONLocalBlock2D()        
+        if net_bayesian!=0:
+            self.MCDropout = MCDropout(p=net_bayesian)
+            if 'resne' in net_encoder_name or 'densenet' in net_encoder_name:
+                # self.net.encoder.layer1 = nn.Sequential(self.MCDropout, self.net.encoder.layer1)
+                # self.net.encoder.layer2 = nn.Sequential(self.MCDropout, self.net.encoder.layer2)
+                # self.net.encoder.layer3 = nn.Sequential(self.MCDropout, self.net.encoder.layer3)
+                self.net.encoder.layer4 = nn.Sequential(self.MCDropout, self.net.encoder.layer4)
+            elif 'efficientnet' in net_encoder_name:
                 self.net.encoder.bn2 =  nn.Sequential(self.MCDropout, self.net.encoder.bn2) # efficientnet
-                print(self.net.encoder.bn2)
-            elif 'regnet' in encoder_name:                                
+            elif 'regnet' in net_encoder_name:                                
 #                 self.net.encoder.s1 = nn.Sequential(self.MCDropout,self.net.encoder.s1) # regnet
 #                 self.net.encoder.s2 = nn.Sequential(self.MCDropout,self.net.encoder.s2) # regnet
 #                 self.net.encoder.s3 = nn.Sequential(self.MCDropout,self.net.encoder.s3) # regnet
                 self.net.encoder.s4 = nn.Sequential(self.MCDropout,self.net.encoder.s4) # regnet
-#                 print(self.net.encoder.s4)
                 
     def forward(self,x):
         return self.net(x)    
     
+class smp_unetplusplus(nn.Module):
+    def __init__(self, net_encoder_name='resnet50', net_inputch=3, net_outputch=2, net_norm='batch', net_bayesian=0):
+        super(smp_unetplusplus, self).__init__()        
+        self.net_inputch = net_inputch
+        self.net_outputch = net_outputch
+        
+        self.net = smp.UnetPlusPlus(
+                        encoder_name=net_encoder_name,
+                        decoder_use_batchnorm = True,
+                        decoder_attention_type ='scse',
+                        encoder_weights='imagenet',
+                        encoder_depth=5,
+                        in_channels=self.net_inputch, 
+                        classes=self.net_outputch)
+        
+        if net_norm=='group':
+            self.net = bn2group(self.net)
+        elif net_norm == 'instance':
+            self.net = bn2instance(self.net)
+#         if nnblock:
+#             self.conv1.out_channels
+#             self.nnblock = NONLocalBlock2D()        
+        if net_bayesian!=0:
+            self.MCDropout = MCDropout(p=net_bayesian)
+            if 'resne' in net_encoder_name or 'densenet' in net_encoder_name:
+                # self.net.encoder.layer1 = nn.Sequential(self.MCDropout, self.net.encoder.layer1)
+                # self.net.encoder.layer2 = nn.Sequential(self.MCDropout, self.net.encoder.layer2)
+                # self.net.encoder.layer3 = nn.Sequential(self.MCDropout, self.net.encoder.layer3)
+                self.net.encoder.layer4 = nn.Sequential(self.MCDropout, self.net.encoder.layer4)
+            elif 'efficientnet' in net_encoder_name:
+                self.net.encoder.bn2 =  nn.Sequential(self.MCDropout, self.net.encoder.bn2) # efficientnet
+            elif 'regnet' in net_encoder_name:                                
+#                 self.net.encoder.s1 = nn.Sequential(self.MCDropout,self.net.encoder.s1) # regnet
+#                 self.net.encoder.s2 = nn.Sequential(self.MCDropout,self.net.encoder.s2) # regnet
+#                 self.net.encoder.s3 = nn.Sequential(self.MCDropout,self.net.encoder.s3) # regnet
+                self.net.encoder.s4 = nn.Sequential(self.MCDropout,self.net.encoder.s4) # regnet
+                
+    def forward(self,x):
+        return self.net(x)    
+    
+    
 class smp_FPN(nn.Module):
-    def __init__(self, encoder_name='resnet50', net_inputch=3, net_outputch=2, net_norm='batch', baysian=False):
+    def __init__(self, net_encoder_name='resnet50', net_inputch=3, net_outputch=2, net_norm='batch', bayesian=0):
         super(smp_FPN, self).__init__()        
         self.net_inputch = net_inputch
         self.net_outputch = net_outputch  
         self.net = smp.FPN(
-                        encoder_name=encoder_name,
+                        encoder_name=net_encoder_name,
                         encoder_weights='imagenet',
                         decoder_merge_policy= 'cat',
                         encoder_depth=5,
@@ -299,19 +876,20 @@ class smp_FPN(nn.Module):
         elif net_norm == 'instance':
             self.net = bn2instance(self.net)
             
-        if baysian:
-            self.MCDropout = MCDropout()
-
-            if 'resne' in encoder_name or 'densenet' in encoder_name:
-                list(self.net.encoder.children())[-1][-1] = nn.Sequential(self.MCDropout,list(self.net.encoder.children())[-1][-1]) # bottleneck
-                print(list(self.net.encoder.children())[-1][-1])
-            elif 'efficientnet' in encoder_name:
+        if bayesian!=0:
+            self.MCDropout = MCDropout(p=bayesian)
+            if 'resne' in net_encoder_name or 'densenet' in net_encoder_name:
+                # self.net.encoder.layer1 = nn.Sequential(self.MCDropout, self.net.encoder.layer1)
+                # self.net.encoder.layer2 = nn.Sequential(self.MCDropout, self.net.encoder.layer2)
+                # self.net.encoder.layer3 = nn.Sequential(self.MCDropout, self.net.encoder.layer3)
+                self.net.encoder.layer4 = nn.Sequential(self.MCDropout, self.net.encoder.layer4)
+            elif 'efficientnet' in net_encoder_name:
                 self.net.encoder.bn2 =  nn.Sequential(self.MCDropout, self.net.encoder.bn2) # efficientnet
-                print(self.net.encoder.bn2)
-            elif 'regnet' in encoder_name:                
-                net.encoder.s4 = nn.Sequential(self.MCDropout,self.net.encoder.s4) # regnet
-#                 self.net.encoder.s4.b1 = nn.Sequential(self.MCDropout,self.net.encoder.s4.b1) # regnety
-                print(self.net.encoder.s4)
+            elif 'regnet' in net_encoder_name:                                
+#                 self.net.encoder.s1 = nn.Sequential(self.MCDropout,self.net.encoder.s1) # regnet
+#                 self.net.encoder.s2 = nn.Sequential(self.MCDropout,self.net.encoder.s2) # regnet
+#                 self.net.encoder.s3 = nn.Sequential(self.MCDropout,self.net.encoder.s3) # regnet
+                self.net.encoder.s4 = nn.Sequential(self.MCDropout,self.net.encoder.s4) # regnet
                 
     def forward(self,x):
         return self.net(x)    
@@ -322,7 +900,7 @@ from typing import Optional, Union, List
 
 class smp_unetRecSoft(nn.Module):
     def __init__(self,
-        encoder_name = 'resnet50',
+        net_encoder_name = 'resnet50',
         encoder_depth = 5,
         encoder_weights  = "imagenet",
         decoder_use_batchnorm = True,
@@ -333,12 +911,12 @@ class smp_unetRecSoft(nn.Module):
         activation = None,
         mode = 'soft',
         upsample_type = 'upsample',
-        net_norm='batch', baysian=False,
+        net_norm='batch', net_bayesian=0,
         **kwargs):
         super(smp_unetRecSoft, self).__init__()
         
         self.mode = mode
-        self.base_net = smp.Unet(encoder_name=encoder_name, in_channels=net_inputch, classes=net_outputch, decoder_attention_type=decoder_attention_type)
+        self.base_net = smp.Unet(encoder_name=net_encoder_name, in_channels=net_inputch, classes=net_outputch, decoder_attention_type=decoder_attention_type)
         if self.mode == 'soft':
             self.recon_decoder = AE_Decoder(
                 encoder_channels=self.base_net.encoder.out_channels,
@@ -346,7 +924,7 @@ class smp_unetRecSoft(nn.Module):
                 n_blocks=encoder_depth,
                 upsample_type = upsample_type,
                 use_batchnorm=decoder_use_batchnorm,
-                center=True if encoder_name.startswith("vgg") else False,
+                center=True if net_encoder_name.startswith("vgg") else False,
                 attention_type=decoder_attention_type
             )
             self.recon_head = ReconstructionHead(
@@ -364,27 +942,24 @@ class smp_unetRecSoft(nn.Module):
             )
             
         if net_norm=='group':
-            self.net = bn2group(self.net)
+            self.base_net = bn2group(self.base_net)
         elif net_norm == 'instance':
-            self.net = bn2instance(self.net)
-#         if nnblock:
-#             self.nnblock = self.conv1.out_channels
-        if baysian:
-            self.net = self.base_net
-            self.MCDropout = MCDropout()
-
-            if 'resne' in encoder_name or 'densenet' in encoder_name:
-                list(self.net.encoder.children())[-1][-1] = nn.Sequential(self.MCDropout,list(self.net.encoder.children())[-1][-1]) # bottleneck
-                print(list(self.net.encoder.children())[-1][-1])
-            elif 'efficientnet' in encoder_name:
-                self.net.encoder.bn2 =  nn.Sequential(self.MCDropout, self.net.encoder.bn2) # efficientnet
-                print(self.net.encoder.bn2)
-            elif 'regnet' in encoder_name:                
-                self.net.encoder.s4 = nn.Sequential(self.MCDropout,self.net.encoder.s4) # regnet
-#                 self.net.encoder.s4.b1 = nn.Sequential(self.MCDropout,self.net.encoder.s4.b1) # regnety
-                print(self.net.encoder.s4)
+            self.base_net = bn2instance(self.base_net)
+        if net_bayesian!=0:
+            self.MCDropout = MCDropout(p=net_bayesian)
+            if 'resne' in net_encoder_name or 'densenet' in net_encoder_name:
+                # self.net.encoder.layer1 = nn.Sequential(self.MCDropout, self.net.encoder.layer1)
+                # self.net.encoder.layer2 = nn.Sequential(self.MCDropout, self.net.encoder.layer2)
+                # self.net.encoder.layer3 = nn.Sequential(self.MCDropout, self.net.encoder.layer3)
+                self.base_net.encoder.layer4 = nn.Sequential(self.MCDropout, self.base_net.encoder.layer4)
+            elif 'efficientnet' in net_encoder_name:
+                self.base_net.encoder.bn2 =  nn.Sequential(self.MCDropout, self.base_net.encoder.bn2) # efficientnet
+            elif 'regnet' in net_encoder_name:                                
+#                 self.net.encoder.s1 = nn.Sequential(self.MCDropout,self.net.encoder.s1) # regnet
+#                 self.net.encoder.s2 = nn.Sequential(self.MCDropout,self.net.encoder.s2) # regnet
+#                 self.net.encoder.s3 = nn.Sequential(self.MCDropout,self.net.encoder.s3) # regnet
+                self.base_net.encoder.s4 = nn.Sequential(self.MCDropout,self.base_net.encoder.s4) # regnet
                 
-            
     def forward(self,x):
         yhat = self.base_net(x)
         bottleneck = self.base_net.encoder(x)
@@ -409,7 +984,7 @@ class smp_unetRecHard(nn.Module):
         activation = None,
         mode = 'hard',
         upsample_type = 'upsample',
-        net_norm='batch', baysian=False,
+        net_norm='batch', bayesian=0,
         **kwargs):
         super(smp_unetRecHard, self).__init__()
         
@@ -445,20 +1020,20 @@ class smp_unetRecHard(nn.Module):
             self.net = bn2instance(self.net)
 #         if nnblock:
 #             self.nnblock = self.conv1.out_channels
-        if baysian:
-            self.net = self.base_net
-            self.MCDropout = MCDropout()
-
+        if bayesian!=0:
+            self.MCDropout = MCDropout(p=bayesian)
             if 'resne' in encoder_name or 'densenet' in encoder_name:
-                list(self.net.encoder.children())[-1][-1] = nn.Sequential(self.MCDropout,list(self.net.encoder.children())[-1][-1]) # bottleneck
-                print(list(self.net.encoder.children())[-1][-1])
+                # self.net.encoder.layer1 = nn.Sequential(self.MCDropout, self.net.encoder.layer1)
+                # self.net.encoder.layer2 = nn.Sequential(self.MCDropout, self.net.encoder.layer2)
+                # self.net.encoder.layer3 = nn.Sequential(self.MCDropout, self.net.encoder.layer3)
+                self.net.encoder.layer4 = nn.Sequential(self.MCDropout, self.net.encoder.layer4)
             elif 'efficientnet' in encoder_name:
                 self.net.encoder.bn2 =  nn.Sequential(self.MCDropout, self.net.encoder.bn2) # efficientnet
-                print(self.net.encoder.bn2)
-            elif 'regnet' in encoder_name:                
+            elif 'regnet' in encoder_name:                                
+#                 self.net.encoder.s1 = nn.Sequential(self.MCDropout,self.net.encoder.s1) # regnet
+#                 self.net.encoder.s2 = nn.Sequential(self.MCDropout,self.net.encoder.s2) # regnet
+#                 self.net.encoder.s3 = nn.Sequential(self.MCDropout,self.net.encoder.s3) # regnet
                 self.net.encoder.s4 = nn.Sequential(self.MCDropout,self.net.encoder.s4) # regnet
-#                 self.net.encoder.s4.b1 = nn.Sequential(self.MCDropout,self.net.encoder.s4.b1) # regnety
-                print(self.net.encoder.s4)
             
     def forward(self,x):
         yhat = self.base_net(x)
@@ -529,78 +1104,6 @@ class smp_FPNRecSoft(nn.Module):
             xhat = self.recon_head(xhat)
         return yhat, xhat
     
-class smp_FPNRecHard(nn.Module):
-    def __init__(self,
-        encoder_name = 'resnet50',
-        encoder_depth= 5,
-        encoder_weights= 'imagenet',
-        decoder_pyramid_channels = 256,
-        decoder_use_batchnorm: bool = True,
-        decoder_channels: List[int] = (256, 128, 64, 32),
-        decoder_attention_type: Optional[str] = 'scse',
-        decoder_segmentation_channels = 128,
-        decoder_merge_policy: str = 'cat',
-        decoder_dropout: float = 0.2,
-        net_inputch = 3,
-        net_outputch = 2,
-        activation = None,
-        upsampling = 4,
-        mode = 'hard',         
-        upsample_type = 'upsample',
-        **kwargs):
-        super(smp_FPNRecHard, self).__init__()
-        
-        self.mode = mode
-        self.base_net = smp.FPN(encoder_name=encoder_name, in_channels=net_inputch, classes=net_outputch, decoder_merge_policy=decoder_merge_policy)
-        if self.mode == 'soft':
-            self.recon_decoder = AE_Decoder(
-                encoder_channels=self.base_net.encoder.out_channels,
-                decoder_channels=decoder_channels,
-                n_blocks=encoder_depth,
-                upsample_type = upsample_type,
-                use_batchnorm=decoder_use_batchnorm,
-                center=True if encoder_name.startswith("vgg") else False,
-                attention_type=decoder_attention_type
-            )
-            self.recon_head = ReconstructionHead(
-                in_channels=decoder_channels[-1]//2,
-                out_channels=net_inputch,
-                activation=activation,
-                kernel_size=3
-            )
-        elif self.mode == 'hard':
-            in_channel = decoder_segmentation_channels if decoder_merge_policy == 'add' else decoder_segmentation_channels*4
-            self.recon_head = ReconstructionHead(
-                in_channels=in_channel,
-                out_channels=net_inputch,
-                activation=activation,
-                kernel_size=3
-            )
-            self.upsample = nn.UpsamplingBilinear2d(scale_factor=4.0)
-#             self.upsample = UpsampleBlock(scale=4, input_channels=in_channels, output_channels=in_channels)
-    def forward(self,x):
-        yhat = self.base_net(x)
-        bottleneck = self.base_net.encoder(x)
-        if self.mode=='soft':
-            xhat = self.recon_decoder(bottleneck[-1])
-            xhat = self.recon_head(xhat)
-        elif self.mode == 'hard':
-            xhat = self.base_net.decoder(*bottleneck)
-            xhat = self.recon_head(xhat)
-            xhat = self.upsample(xhat)
-        return yhat, xhat
-    
-class segresnet(nn.Module):
-    def __init__(self,net_inputch=3,net_outputch=3):
-        super(segresnet, self).__init__()        
-        self.net_inputch = net_inputch
-        self.net_outputch = net_outputch
-        self.net = monai.networks.nets.SegResNet(2,8,in_channels=self.net_inputch, out_channels=self.net_outputch)
-#         self.net = bn2instance(self.net)
-
-    def forward(self,x):
-        return self.net(x)
-
 import pywt
 import torch
 from torch.autograd import Variable
@@ -643,22 +1146,25 @@ def iwt(vres):
     res = torch.zeros(vres.shape[0],int(vres.shape[1]/4),int(vres.shape[2]*2),int(vres.shape[3]*2))
     res = res.cuda()
     for i in range(res.shape[1]):
-#         vres[:,4*i+1:4*i+4]=2*vres[:,4*i+1:4*i+4]-1
         temp = torch.nn.functional.conv_transpose2d(vres[:,4*i:4*i+4], Variable(inv_filters[:,None].cuda(),requires_grad=True),stride=2)
         res[:,i:i+1,:,:] = temp
     return res
 
 class unet(nn.Module):
-    def __init__(self, net_inputch=3, net_outputch=2, num_c=32, wavelet=False, attention=False, rcnn=False, nnblock=False, supervision=False, reconstruction=False):
+    def __init__(self, net_inputch=3, net_outputch=2, net_wavelet=False, net_skipatt=False, net_rcnn=False, net_nnblock=False, net_supervision=False, net_bayesian = 0):
         super(unet,self).__init__()
+        num_c=32
         
-        self.attention = attention
-        self.rcnn = rcnn
-        self.reconstruction = reconstruction
-        self.nnblock = nnblock
-        self.supervision = supervision
-        self.wavelet = wavelet
+        self.attention = net_skipatt
+        self.rcnn = net_rcnn
+        self.nnblock = net_nnblock
+        self.supervision = net_supervision
+        self.wavelet = net_wavelet
+        self.net_bayesian = net_bayesian
         
+        if net_bayesian!=0:
+            self.MCDropout = MCDropout(p=net_bayesian)
+    
         if self.rcnn == False:
             self.Conv1 = conv_block(ch_in=net_inputch, ch_out=num_c)
             self.Conv2 = conv_block(ch_in=num_c*4,ch_out=num_c*2)
@@ -700,10 +1206,9 @@ class unet(nn.Module):
             self.Up3 = up_conv(ch_in=num_c*8, ch_out=num_c*2)
             self.Up2 = up_conv(ch_in=num_c*4, ch_out=num_c*1)
 
-
         if self.nnblock:        
-            self.nnblock2 = NONLocalBlock2D(num_c*2)
-            self.nnblock4 = NONLocalBlock2D(num_c*4)
+            # self.nnblock2 = NONLocalBlock2D(num_c*2)
+            # self.nnblock4 = NONLocalBlock2D(num_c*4)
             self.nnblock8 = NONLocalBlock2D(num_c*8)
             self.nnblock16 = NONLocalBlock2D(num_c*16)
             self.nnblock32 = NONLocalBlock2D(num_c*32)
@@ -728,36 +1233,37 @@ class unet(nn.Module):
                     nn.ReLU(),
                     nn.Conv2d(num_c, net_outputch, kernel_size=1,stride=1,padding=0,bias=True),
             )
-            
-        if self.reconstruction:
-            self.Conv_recon_image = nn.Sequential(self.Conv_final[:-1], nn.Conv2d(num_c, net_inputch, kernel_size=1,stride=1,padding=0,bias=True))
-            self.Conv_recon_bg = nn.Sequential(self.Conv_final[:-1], nn.Conv2d(num_c, 1, kernel_size=1,stride=1,padding=0,bias=True))                
+               
                 
     def forward(self,x):
 #         print('x',x.shape)
 
         # encoding path
-        x1 = self.Conv1(x) if self.rcnn==False else self.RRCNN1(x)
+        x1 = self.RRCNN1(x) if self.rcnn else self.Conv1(x)
 #         print('x1',x1.shape)
 
         x2 = wt(x1) if self.wavelet else self.Maxpool2(x1)
 #         x2 = self.nnblock4(x2) if self.nnblock else x2
-        x2 = self.Conv2(x2) if self.rcnn==False else self.RRCNN2(x2)
+        x2 = self.RRCNN2(x2) if self.rcnn else self.Conv2(x2)
 #         print('x2',x2.shape)
 
         x3 = wt(x2) if self.wavelet else self.Maxpool3(x2)
-        x3 = self.nnblock8(x3) if self.nnblock else x3
-        x3 = self.Conv3(x3) if self.rcnn==False else self.RRCNN3(x3)
+        x3 = self.MCDropout(x3) if self.net_bayesian!=0 else x3  # MCDropout!
+        x3 = self.nnblock8(x3) if self.nnblock else x3        
+        x3 = self.RRCNN3(x3) if self.rcnn else self.Conv3(x3)
+
 #         print('x3',x3.shape)
 
         x4 = wt(x3) if self.wavelet else self.Maxpool4(x3)
+        x4 = self.MCDropout(x4) if self.net_bayesian!=0 else x4  # MCDropout!
         x4 = self.nnblock16(x4) if self.nnblock else x4
-        x4 = self.Conv4(x4) if self.rcnn==False else self.RRCNN4(x4)
+        x4 = self.RRCNN4(x4) if self.rcnn else self.Conv4(x4)
 #         print('x4',x4.shape)
 
         x5 = wt(x4) if self.wavelet else self.Maxpool5(x4)
+        x5 = self.MCDropout(x5) if self.net_bayesian!=0 else x5  # MCDropout!
         x5 = self.nnblock32(x5) if self.nnblock else x5
-        x5 = self.Conv5(x5) if self.rcnn==False else self.RRCNN5(x5)
+        x5 = self.RRCNN5(x5) if self.rcnn else self.Conv5(x5)
 #         print('x5',x5.shape)
 
         # decoding + concat path
@@ -765,28 +1271,34 @@ class unet(nn.Module):
         x4 = self.Att5(g=d5,x=x4) if self.attention else x4
         d5 = torch.cat((x4,d5),dim=1)
         d5 = self.nnblock16(d5) if self.nnblock else d5
-        d5 = self.Up_conv5(d5) if self.rcnn == False else self.Up_RRCNN5(d5)
+        # d5 = self.Up_conv5(d5) if self.rcnn == False else self.Up_RRCNN5(d5)
+        d5 = self.Up_RRCNN5(d5) if self.rcnn else self.Up_conv5(d5)
 #         print('d5',d5.shape)
 
         d4=iwt(d5) if self.wavelet else self.Up4(d5)
         x3 = self.Att4(g=d4,x=x3) if self.attention else x3
         d4 = torch.cat((x3,d4),dim=1)
         d4 = self.nnblock8(d4) if self.nnblock else d4
-        d4 = self.Up_conv4(d4) if self.rcnn == False else self.Up_RRCNN4(d4)
+        # d4 = self.Up_conv4(d4) if self.rcnn == False else self.Up_RRCNN4(d4)
+        d4 = self.Up_RRCNN4(d4) if self.rcnn else self.Up_conv4(d4)
+
 #         print('d4',d4.shape)
 
         d3=iwt(d4) if self.wavelet else self.Up3(d4)
         x2 = self.Att3(g=d3,x=x2) if self.attention else x2
         d3 = torch.cat((x2,d3),dim=1)
-        d3 = self.nnblock4(d3) if self.nnblock else d3
-        d3 = self.Up_conv3(d3) if self.rcnn == False else self.Up_RRCNN3(d3)
-#         print('d3',d3.shape)
+        # d3 = self.nnblock4(d3) if self.nnblock else d3
+        # d3 = self.Up_conv3(d3) if self.rcnn == False else self.Up_RRCNN3(d3)
+        d3 = self.Up_RRCNN3(d3) if self.rcnn else self.Up_conv3(d3)
+
+        #         print('d3',d3.shape)
 
         d2=iwt(d3) if self.wavelet else self.Up2(d3)
         x1 = self.Att2(g=d2,x=x1) if self.attention else x1
         d2 = torch.cat((x1,d2),dim=1)
 #         d2 = self.nnblock2(d2) if self.nnblock else d2
-        d2 = self.Up_conv2(d2) if self.rcnn == False else self.Up_RRCNN2(d2)
+        # d2 = self.Up_conv2(d2) if self.rcnn == False else self.Up_RRCNN2(d2)
+        d2 = self.Up_RRCNN2(d2) if self.rcnn else self.Up_conv2(d2)
 #         print('d2',d2.shape)
 
         if self.supervision:
@@ -801,18 +1313,10 @@ class unet(nn.Module):
             
         else:
             d1 = self.Conv_final(d2)            
-#         print('d1',d1.shape)
 
-        if self.reconstruction:
-            d1_recon_image = self.Conv_recon_image(d2)
-#             d1_recon_bg = self.Conv_recon_bg(d2)
-            
-            return d1, d1_recon_image
-        else:
-            return d1
+        return d1
 
 # weight standardization
-    
 class Conv2d(nn.Conv2d):
     
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True):
@@ -980,7 +1484,7 @@ class U_Net(nn.Module):
         self.Up_conv2 = conv_block(ch_in=128, ch_out=64)
 
         self.Conv_1x1 = nn.Conv2d(64,output_ch,kernel_size=1,stride=1,padding=0)
-
+        
 
     def forward(self,x):
         # encoding path
@@ -1019,7 +1523,6 @@ class U_Net(nn.Module):
         d1 = self.Conv_1x1(d2)
 
         return d1
-
 
 class R2U_Net(nn.Module):
     def __init__(self,img_ch=3,output_ch=2,t=2,norm='batch'):
@@ -1087,7 +1590,7 @@ class R2U_Net(nn.Module):
         return d1
 
 class AttU_Net(nn.Module):
-    def __init__(self,img_ch=1,output_ch=1,norm='instance',mc_dropout=True):
+    def __init__(self,img_ch=3,output_ch=2,ws=False,net_bayesian=0):
         super(AttU_Net,self).__init__()
         
         self.Maxpool = nn.MaxPool2d(kernel_size=2,stride=2)
@@ -1114,18 +1617,10 @@ class AttU_Net(nn.Module):
         self.Att2 = attention_block(F_g=64,F_l=64,F_int=32,norm=norm)
         self.Up_conv2 = conv_block(ch_in=128, ch_out=64,norm=norm)
         
-        if norm != 'ws':
-            self.Conv_1x1 = nn.Conv2d(64,output_ch,kernel_size=1,stride=1,padding=0)
-        else:
-            self.Conv_1x1 = Conv2d(64,output_ch,kernel_size=1,stride=1,padding=0)
-            
-        if mc_dropout==True:
-            self.MCDropout = MCDropout(p=0.3)
-        else:
-            self.MCDropout = MCDropout(p=0.0)
-        
-#         self.nnblock512 = NONLocalBlock2D(512)
-#         self.nnblock1024 = NONLocalBlock2D(1024)
+        self.Conv_1x1 = nn.Conv2d(64,output_ch,kernel_size=1,stride=1,padding=0) if ws == False else Conv2d(64,output_ch,kernel_size=1,stride=1,padding=0) 
+        self.net_bayesian = net_bayesian
+        if self.net_bayesian !=0:
+            self.MCDropout = MCDropout(p=self.net_bayesian)
         
     def forward(self,x):
         # encoding path
@@ -1146,9 +1641,9 @@ class AttU_Net(nn.Module):
 #         x4 = self.MCDropout(x4)
 
         x5 = self.Maxpool(x4)
+        x5 = self.MCDropout(x5) if self.net_bayesian!=0 else x5
         x5 = self.Conv5(x5)
 #         x5 = self.nnblock1024(x5) 
-        x5 = self.MCDropout(x5)
 
         # decoding + concat path
         d5 = self.Up5(x5)
@@ -1180,251 +1675,39 @@ class AttU_Net(nn.Module):
 
         return d1
 
-class SoftMTL_AttUNet(nn.Module):
-    def __init__(self,img_ch=3,output_ch=2,recon_ch=3,norm = 'batch'):
-        super(SoftMTL_AttUNet,self).__init__()
-        
-        self.Maxpool = nn.MaxPool2d(kernel_size=2,stride=2)
-
-        self.Conv1 = conv_block(ch_in=img_ch,ch_out=64,norm=norm)
-        self.Conv2 = conv_block(ch_in=64,ch_out=128,norm=norm)
-        self.Conv3 = conv_block(ch_in=128,ch_out=256,norm=norm)
-        self.Conv4 = conv_block(ch_in=256,ch_out=512,norm=norm)
-        self.Conv5 = conv_block(ch_in=512,ch_out=1024,norm=norm)
-
-        self.Up5 = up_conv(ch_in=1024,ch_out=512,norm=norm)
-        self.Att5 = attention_block(F_g=512,F_l=512,F_int=256,norm=norm)
-        self.Up_conv5 = conv_block(ch_in=1024, ch_out=512,norm=norm)
-
-        self.Up4 = up_conv(ch_in=512,ch_out=256,norm=norm)
-        self.Att4 = attention_block(F_g=256,F_l=256,F_int=128,norm=norm)
-        self.Up_conv4 = conv_block(ch_in=512, ch_out=256,norm=norm)
-        
-        self.Up3 = up_conv(ch_in=256,ch_out=128,norm=norm)
-        self.Att3 = attention_block(F_g=128,F_l=128,F_int=64,norm=norm)
-        self.Up_conv3 = conv_block(ch_in=256, ch_out=128,norm=norm)
-        
-        self.Up2 = up_conv(ch_in=128,ch_out=64,norm=norm)
-        self.Att2 = attention_block(F_g=64,F_l=64,F_int=32,norm=norm)
-        self.Up_conv2 = conv_block(ch_in=128, ch_out=64,norm=norm)
-
-        self.Conv_1x1 = nn.Conv2d(64,output_ch,kernel_size=1,stride=1,padding=0)
-        self.Conv_1x1_r = nn.Conv2d(64,recon_ch,kernel_size=1,stride=1,padding=0)
-        
-        self.MCDropout = MCDropout(p=0.5)
-        
-        self.nnblock512 = NONLocalBlock2D(512)
-        self.nnblock1024 = NONLocalBlock2D(1024)
-        
-    def forward(self,x):
-        # encoding path
-        x1 = self.Conv1(x)
-        x1 = self.MCDropout(x1)
-
-        x2 = self.Maxpool(x1)
-        x2 = self.Conv2(x2)
-        x2 = self.MCDropout(x2)
-        
-        x3 = self.Maxpool(x2)
-        x3 = self.Conv3(x3)
-        x3 = self.MCDropout(x3)
-
-        x4 = self.Maxpool(x3)
-        x4 = self.Conv4(x4)
-#         x4 = self.nnblock512(x4) 
-        x4 = self.MCDropout(x4)
-
-        x5 = self.Maxpool(x4)
-        x5 = self.Conv5(x5)
-#         x5 = self.nnblock1024(x5) 
-        x5 = self.MCDropout(x5)
-
-        # decoding + concat path
-        d5 = self.Up5(x5)
-        x4 = self.Att5(g=d5,x=x4)
-        d5 = torch.cat((x4,d5),dim=1)        
-        d5 = self.Up_conv5(d5)
-#         d5 = self.nnblock512(d5) 
-        d5 = self.MCDropout(d5)
-        
-        d4 = self.Up4(d5)
-        x3 = self.Att4(g=d4,x=x3)
-        d4 = torch.cat((x3,d4),dim=1)
-        d4 = self.Up_conv4(d4)
-        d4 = self.MCDropout(d4)
-        
-        d3 = self.Up3(d4)
-        x2 = self.Att3(g=d3,x=x2)
-        d3 = torch.cat((x2,d3),dim=1)
-        d3 = self.Up_conv3(d3)
-        d3 = self.MCDropout(d3)
-        
-        d2 = self.Up2(d3)
-        x1 = self.Att2(g=d2,x=x1)
-        d2 = torch.cat((x1,d2),dim=1)
-        d2 = self.Up_conv2(d2)
-        d2 = self.MCDropout(d2)
-
-        d1 = self.Conv_1x1(d2)
-    
-        # decoding + concat path
-        r5 = self.Up5(x5)
-        x4 = self.Att5(g=r5,x=x4)
-        r5 = torch.cat((x4,r5),dim=1)        
-        r5 = self.Up_conv5(r5)
-        r5 = self.MCDropout(r5)
-        
-        r4 = self.Up4(r5)
-        x3 = self.Att4(g=r4,x=x3)
-        r4 = torch.cat((x3,r4),dim=1)
-        r4 = self.Up_conv4(r4)
-        r4 = self.MCDropout(r4)
-        
-        r3 = self.Up3(r4)
-        x2 = self.Att3(g=r3,x=x2)
-        r3 = torch.cat((x2,r3),dim=1)
-        r3 = self.Up_conv3(r3)
-        r3 = self.MCDropout(r3)
-        
-        r2 = self.Up2(r3)
-        x1 = self.Att2(g=r2,x=x1)
-        r2 = torch.cat((x1,r2),dim=1)
-        r2 = self.Up_conv2(r2)
-        r2 = self.MCDropout(r2)
-
-        r1 = self.Conv_1x1_r(r2)
-
-        return d1,r1
-
-class HardMTL_AttUNet(nn.Module):
-    def __init__(self,img_ch=3,output_ch=2,recon_ch=3,norm = 'batch'):
-        super(HardMTL_AttUNet,self).__init__()
-        
-        self.Maxpool = nn.MaxPool2d(kernel_size=2,stride=2)
-        
-        self.Conv1 = conv_block(ch_in=img_ch,ch_out=64,norm=norm)
-        self.Conv2 = conv_block(ch_in=64,ch_out=128,norm=norm)
-        self.Conv3 = conv_block(ch_in=128,ch_out=256,norm=norm)
-        self.Conv4 = conv_block(ch_in=256,ch_out=512,norm=norm)
-        self.Conv5 = conv_block(ch_in=512,ch_out=1024,norm=norm)
-
-        self.Up5 = up_conv(ch_in=1024,ch_out=512,norm=norm)
-        self.Att5 = attention_block(F_g=512,F_l=512,F_int=256,norm=norm)
-        self.Up_conv5 = conv_block(ch_in=1024, ch_out=512,norm=norm)
-
-        self.Up4 = up_conv(ch_in=512,ch_out=256,norm=norm)
-        self.Att4 = attention_block(F_g=256,F_l=256,F_int=128,norm=norm)
-        self.Up_conv4 = conv_block(ch_in=512, ch_out=256,norm=norm)
-        
-        self.Up3 = up_conv(ch_in=256,ch_out=128,norm=norm)
-        self.Att3 = attention_block(F_g=128,F_l=128,F_int=64,norm=norm)
-        self.Up_conv3 = conv_block(ch_in=256, ch_out=128,norm=norm)
-        
-        self.Up2 = up_conv(ch_in=128,ch_out=64,norm=norm)
-        self.Att2 = attention_block(F_g=64,F_l=64,F_int=32,norm=norm)
-        self.Up_conv2 = conv_block(ch_in=128, ch_out=64,norm=norm)
-
-        self.Conv_1x1 = nn.Conv2d(64,output_ch,kernel_size=1,stride=1,padding=0)
-        self.Conv_1x1_r = nn.Conv2d(64,recon_ch,kernel_size=1,stride=1,padding=0)
-        
-        self.MCDropout = MCDropout(p=0.5)
-        
-        self.nnblock512 = NONLocalBlock2D(512)
-        self.nnblock1024 = NONLocalBlock2D(1024)
-        
-    def forward(self,x):
-        # encoding path
-        x1 = self.Conv1(x)
-        x1 = self.MCDropout(x1)
-
-        x2 = self.Maxpool(x1)
-        x2 = self.Conv2(x2)
-        x2 = self.MCDropout(x2)
-        
-        x3 = self.Maxpool(x2)
-        x3 = self.Conv3(x3)
-        x3 = self.MCDropout(x3)
-
-        x4 = self.Maxpool(x3)
-        x4 = self.Conv4(x4)
-#         x4 = self.nnblock512(x4) 
-        x4 = self.MCDropout(x4)
-
-        x5 = self.Maxpool(x4)
-        x5 = self.Conv5(x5)
-#         x5 = self.nnblock1024(x5) 
-        x5 = self.MCDropout(x5)
-
-        # decoding + concat path
-        d5 = self.Up5(x5)
-        x4 = self.Att5(g=d5,x=x4)
-        d5 = torch.cat((x4,d5),dim=1)        
-        d5 = self.Up_conv5(d5)
-#         d5 = self.nnblock512(d5) 
-        d5 = self.MCDropout(d5)
-        
-        d4 = self.Up4(d5)
-        x3 = self.Att4(g=d4,x=x3)
-        d4 = torch.cat((x3,d4),dim=1)
-        d4 = self.Up_conv4(d4)
-        d4 = self.MCDropout(d4)
-        
-        d3 = self.Up3(d4)
-        x2 = self.Att3(g=d3,x=x2)
-        d3 = torch.cat((x2,d3),dim=1)
-        d3 = self.Up_conv3(d3)
-        d3 = self.MCDropout(d3)
-        
-        d2 = self.Up2(d3)
-        x1 = self.Att2(g=d2,x=x1)
-        d2 = torch.cat((x1,d2),dim=1)
-        d2 = self.Up_conv2(d2)
-        d2 = self.MCDropout(d2)
-
-        d1 = self.Conv_1x1(d2)
-        
-        r2 = self.Up2(d3)
-        x1 = self.Att2(g=r2,x=x1)
-        r2 = torch.cat((x1,r2),dim=1)
-        r2 = self.Up_conv2(r2)
-        r2 = self.MCDropout(r2)
-
-        r1 = self.Conv_1x1_r(r2)
-
-        return d1,r1
-
 class R2AttU_Net(nn.Module):
-    def __init__(self,net_inputch=3,net_outputch=2,t=2,norm='batch',p=0):
+    def __init__(self,net_inputch=3,net_outputch=2,t=2,net_bayesian=0):
         super(R2AttU_Net,self).__init__()
         
         self.Maxpool = nn.MaxPool2d(kernel_size=2,stride=2)
         self.Upsample = nn.Upsample(scale_factor=2)
 
-        self.RRCNN1 = RRCNN_block(ch_in=net_inputch,ch_out=64,t=t,norm=norm)
-        self.RRCNN2 = RRCNN_block(ch_in=64,ch_out=128,t=t,norm=norm)        
-        self.RRCNN3 = RRCNN_block(ch_in=128,ch_out=256,t=t,norm=norm)        
-        self.RRCNN4 = RRCNN_block(ch_in=256,ch_out=512,t=t,norm=norm)        
-        self.RRCNN5 = RRCNN_block(ch_in=512,ch_out=1024,t=t,norm=norm)        
+        self.RRCNN1 = RRCNN_block(ch_in=net_inputch,ch_out=64,t=t)
+        self.RRCNN2 = RRCNN_block(ch_in=64,ch_out=128,t=t)        
+        self.RRCNN3 = RRCNN_block(ch_in=128,ch_out=256,t=t)        
+        self.RRCNN4 = RRCNN_block(ch_in=256,ch_out=512,t=t)        
+        self.RRCNN5 = RRCNN_block(ch_in=512,ch_out=1024,t=t)        
 
-        self.Up5 = up_conv(ch_in=1024,ch_out=512,norm=norm)
-        self.Att5 = attention_block(F_g=512,F_l=512,F_int=256,norm=norm)
-        self.Up_RRCNN5 = RRCNN_block(ch_in=1024, ch_out=512,t=t,norm=norm)
+        self.Up5 = up_conv(ch_in=1024,ch_out=512)
+        self.Att5 = attention_block(F_g=512,F_l=512,F_int=256)
+        self.Up_RRCNN5 = RRCNN_block(ch_in=1024, ch_out=512,t=t)
         
-        self.Up4 = up_conv(ch_in=512,ch_out=256,norm=norm)
-        self.Att4 = attention_block(F_g=256,F_l=256,F_int=128,norm=norm)
-        self.Up_RRCNN4 = RRCNN_block(ch_in=512, ch_out=256,t=t,norm=norm)
+        self.Up4 = up_conv(ch_in=512,ch_out=256)
+        self.Att4 = attention_block(F_g=256,F_l=256,F_int=128)
+        self.Up_RRCNN4 = RRCNN_block(ch_in=512, ch_out=256,t=t)
         
-        self.Up3 = up_conv(ch_in=256,ch_out=128,norm=norm)
-        self.Att3 = attention_block(F_g=128,F_l=128,F_int=64,norm=norm)
-        self.Up_RRCNN3 = RRCNN_block(ch_in=256, ch_out=128,t=t,norm=norm)
+        self.Up3 = up_conv(ch_in=256,ch_out=128)
+        self.Att3 = attention_block(F_g=128,F_l=128,F_int=64)
+        self.Up_RRCNN3 = RRCNN_block(ch_in=256, ch_out=128,t=t)
         
-        self.Up2 = up_conv(ch_in=128,ch_out=64,norm=norm)
-        self.Att2 = attention_block(F_g=64,F_l=64,F_int=32,norm=norm)
-        self.Up_RRCNN2 = RRCNN_block(ch_in=128, ch_out=64,t=t,norm=norm)
+        self.Up2 = up_conv(ch_in=128,ch_out=64)
+        self.Att2 = attention_block(F_g=64,F_l=64,F_int=32)
+        self.Up_RRCNN2 = RRCNN_block(ch_in=128, ch_out=64,t=t)
         
         self.Conv_1x1 = nn.Conv2d(64,net_outputch,kernel_size=1,stride=1,padding=0)  
-        self.MCDropout = MCDropout(p=p)     
-        
+        if net_bayesian !=0:
+            self.MCDropout = MCDropout(p=net_bayesian)
+            
 #         self.nnblock256 = NONLocalBlock2D(256)
 #         self.nnblock512 = NONLocalBlock2D(512)
 #         self.nnblock1024 = NONLocalBlock2D(1024)
@@ -1449,9 +1732,9 @@ class R2AttU_Net(nn.Module):
 #         x4 = self.MCDropout(x4)
 
         x5 = self.Maxpool(x4)
+        x5 = self.MCDropout(x5)
         x5 = self.RRCNN5(x5)
 #         x5 = self.nnblock1024(x5) 
-        x5 = self.MCDropout(x5)
         
         # decoding + concat path
         d5 = self.Up5(x5)
@@ -1483,7 +1766,7 @@ class R2AttU_Net(nn.Module):
         d1 = self.Conv_1x1(d2)
 
         return d1
-        
+    
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -2391,16 +2674,6 @@ class SCSEModule(nn.Module):
 
     def forward(self, x):
         return x * self.cSE(x) + x * self.sSE(x)
-
-
-class ArgMax(nn.Module):
-
-    def __init__(self, dim=None):
-        super().__init__()
-        self.dim = dim
-
-    def forward(self, x):
-        return torch.argmax(x, dim=self.dim)
 
 
 class Activation(nn.Module):

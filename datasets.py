@@ -17,8 +17,10 @@ import imageio
 
 from PIL import Image
 from skimage.filters import frangi
+import skimage.morphology
 from skimage.morphology import white_tophat,black_tophat
 from skimage.morphology import disk, star, square
+from skimage.morphology import skeletonize, medial_axis, dilation, disk, remove_small_objects
 from skimage.filters import *
 
 import kornia
@@ -37,7 +39,6 @@ def clahe(img,adaptive_hist_range=False):
     for idx in range(temp.shape[-1]):
         temp[...,idx] = mclahe.mclahe(img[...,idx], adaptive_hist_range=adaptive_hist_range)
     return temp
-
 
 # Data Module
 class dataset_CLAHE():
@@ -111,6 +112,11 @@ class dataset_CLAHE():
         if self.transform_spatial:
             sample = self.transform_spatial(image = x, mask = y)
             x, y = sample['image'], sample['mask']
+        
+        # # inverse weight of y
+        # skeleton,distance = medial_axis(y[...,0], return_distance=True)
+        # distance[distance==0]=1000
+        # y = np.expand_dims(np.exp(-distance/16),-1)
         
         # to tensor
         x = np.moveaxis(x,-1,0).astype(np.float32)
@@ -335,23 +341,22 @@ def augmentation_train():
         albu.VerticalFlip(p=0.5),
         
         albu.OneOf([
-#         albu.Downscale(p=0.5),
         albu.InvertImg(p=0.5),
-        albu.RandomBrightnessContrast(brightness_limit=(-0.3, 0.3), contrast_limit=(-0.3, 0.3), brightness_by_max=False, p=0.5),
-        albu.RandomGamma(gamma_limit=(70,120), p=.5),
-        albu.RandomToneCurve(scale=0.2,p=.5),
-        albu.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=10, val_shift_limit=10, p=.5),
+        albu.RandomBrightnessContrast(brightness_limit=(-0.5, 0.3), contrast_limit=(-0.5, 0.3), brightness_by_max=False, p=0.5),
+        albu.RandomGamma(gamma_limit=(50,120), p=.5),
+        albu.RandomToneCurve(scale=0.4,p=.5),
+        albu.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=20, val_shift_limit=20, p=.5),
         albu.ChannelShuffle(p=.5),
         albu.RGBShift(r_shift_limit=20, g_shift_limit=20, b_shift_limit=20, p=.5),
         ],p=0.5),
                 
         albu.OneOf([
-        albu.RandomFog(fog_coef_lower=0.1, fog_coef_upper=.4, alpha_coef=0.06, p=0.3),
-        albu.MotionBlur(blur_limit=5, p=0.3),
-        albu.MedianBlur(blur_limit=5, p=0.3),
-        albu.GlassBlur(sigma=0.1, max_delta=1, p=0.3),
-        albu.Sharpen(alpha=(0.1, 0.3), lightness=(0.7, 1.1), p=0.3)
-        ],p=0.1),
+        albu.RandomFog(fog_coef_lower=0.1, fog_coef_upper=.4, alpha_coef=0.06, p=0.5),
+        albu.MotionBlur(blur_limit=7, p=0.5),
+        albu.MedianBlur(blur_limit=7, p=0.5),
+        albu.GlassBlur(sigma=0.5, max_delta=2, p=0.5),
+        albu.Sharpen(alpha=(0.1, 0.3), lightness=(0.7, 1.1), p=0.5)
+        ],p=0.5),
         
         albu.OneOf([
         albu.GaussNoise(var_limit=0.03, mean=0, p=0.5),

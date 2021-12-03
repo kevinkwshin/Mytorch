@@ -34,6 +34,7 @@ from monai.inferers import sliding_window_inference
 class SegModel(pl.LightningModule):
     def __init__(self,  project: str,
                         data_dir: str,
+                        activation_T: int = 1,
                         batch_size: int = 1,
                         data_module = 'dataset',
                         data_padsize= None,
@@ -49,14 +50,18 @@ class SegModel(pl.LightningModule):
                         net_encoder_name = 'resnet50',
                         net_inputch = 1,
                         net_outputch = 2,
-                        net_baysian=None,
+                        net_bayesian=None,
                         net_ckpt = None,
+                        net_nnblock=False,
+                        net_rcnn=False,
+                        net_skipatt=False,
+                        net_supervision=False,
+                        net_wavelet=False,
                         precision = 32,
                         **kwargs):
                 
         super().__init__(**kwargs)
-#         self.batch_size = batch_size
-#         self.data_dir = data_dir
+        self.activation_T = activation_T 
         self.data_module = data_module
         self.data_padsize = data_padsize
         self.data_cropsize = data_cropsize
@@ -66,37 +71,38 @@ class SegModel(pl.LightningModule):
         self.net_inputch = net_inputch
         self.net_outputch = net_outputch
         self.net_encoder_name = net_encoder_name
-        self.net_baysian = net_baysian
+        self.net_bayesian = net_bayesian
         self.net_norm = net_norm
-#         self.net_activation = net_activation
-#         self.net_nnblock = net_nnblock
-#         self.net_rcnn = net_rcnn
-#         self.net_reconstruction = net_reconstruction
-#         self.net_skipatt = net_skipatt
-#         self.net_supervision = net_supervision
-#         self.net_wavelet = net_wavelet
+        self.net_nnblock = net_nnblock
+        self.net_rcnn = net_rcnn
+        self.net_skipatt = net_skipatt
+        self.net_supervision = net_supervision
+        self.net_wavelet = net_wavelet
         self.precision = precision
         self.project = project
         self.lr = lr
         
         # loss       
         fn_call = getattr(losses, lossfn)
-        self.lossfn = fn_call()
+        self.lossfn = fn_call(activation_T = self.activation_T)
 
         # net
         fn_call = getattr(nets, net_name)
-#         try: 
-#             self.net = fn_call(net_inputch=self.net_inputch, 
-#                                net_outputch=self.net_outputch, 
-#                                attention = self.net_skipatt,
-#                                nnblock=self.net_nnblock, 
-#                                rcnn = self.net_rcnn,
-#                                reconstruction = self.net_reconstruction,
-#                                supervision = self.net_supervision,
-#                                wavelet = self.net_wavelet)
-#         except:
-        self.net = fn_call(net_inputch=self.net_inputch, net_outputch=self.net_outputch, encoder_name = self.net_encoder_name, baysian = self.net_baysian)
-            
+        if 'smp' in net_name:
+            self.net = fn_call(net_inputch=self.net_inputch, net_outputch=self.net_outputch, net_encoder_name = self.net_encoder_name, net_bayesian = self.net_bayesian)
+        elif 'R2AttU' in net_name:
+            self.net = fn_call(net_inputch=self.net_inputch, net_outputch=self.net_outputch, net_bayesian = self.net_bayesian)
+        elif 'monai' in net_name:
+            self.net = fn_call(net_inputch=self.net_inputch, net_outputch=self.net_outputch, net_bayesian = self.net_bayesian) 
+        else:
+            self.net = fn_call(net_inputch=self.net_inputch, 
+                               net_outputch=self.net_outputch, 
+                               net_skipatt = self.net_skipatt,
+                               net_nnblock=self.net_nnblock, 
+                               net_rcnn = self.net_rcnn,
+                               net_supervision = self.net_supervision,
+                               net_wavelet = self.net_wavelet)
+
         if self.net_norm == 'instance':
             self.net = nets.bn2instance(self.net)
         elif self.net_norm == 'group':
@@ -193,7 +199,7 @@ class SegModel(pl.LightningModule):
             metric = self.metric(yhat_temp,y_temp)[0][-1]
         else:
             # single-class
-            metric = self.metric(yhat.round(),y)[0][-1]
+            metric = self.metric(yhat.round(),y.round())[0][-1]
             
         self.log('loss_val', loss, prog_bar=True)
         self.log('metric_val', metric)
@@ -282,14 +288,17 @@ class SegModel(pl.LightningModule):
         mode : lr is given --> Adam with lr with given lr
         mode : lr is not given --> CosineAnnealingWarmup (default), SGD with varying lr
         """
-        
-        optimizer = torch.optim.Adam(self.net.parameters(), lr=self.lr)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.9, patience=10, min_lr=5e-6)
-        
-        return {'optimizer': optimizer,
-                'lr_scheduler': {'scheduler': scheduler,
-                                 'monitor': 'loss_val'}
-                }
+        if self.lr > 1e-4:
+            optimizer = torch.optim.Adam(self.net.parameters(), lr=self.lr)
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.9, patience=20, min_lr=6e-6)
+
+            return {'optimizer': optimizer,
+                    'lr_scheduler': {'scheduler': scheduler,'monitor': 'loss_val'}}
+        else:
+            self.lr = 1e-5
+            optimizer = torch.optim.Adam(self.net.parameters(), lr=self.lr)
+
+            return {'optimizer': optimizer}
     
     @staticmethod
     def add_model_specific_args(parent_parser):  # pragma: no-cover
@@ -307,26 +316,25 @@ class SegModel(pl.LightningModule):
         parser.add_argument("--project", type=str, help="wandb project name, this will set your wandb project")
         parser.add_argument("--data_dir", type=str, help="path where dataset is stored, subfolders name should be x_train, y_train")
         parser.add_argument("--data_module", type=str,default='dataset', help="Data Module, see datasets.py")
-        parser.add_argument("--data_padsize", type=str2bool, default=None, help="input like this (height_width) : pad - crop - resize - patch")
-        parser.add_argument("--data_cropsize", type=str2bool, default=None, help="input like this (height_width) : pad - crop - resize - patch")
-        parser.add_argument("--data_resize", type=str2bool, default=None, help="input like this (height_width) : pad - crop - resize - patch")
-        parser.add_argument("--data_patchsize", type=str2bool, default=None, help="input like this (height_width) : pad - crop - resize - patch: recommand (A * 2^n)")
+        parser.add_argument("--data_padsize", type=str2bool, default=None, help="input like this 'height_width' : pad - crop - resize - patch")
+        parser.add_argument("--data_cropsize", type=str2bool, default=None, help="input like this 'height_width' : pad - crop - resize - patch")
+        parser.add_argument("--data_resize", type=str2bool, default=None, help="input like this 'height_width' : pad - crop - resize - patch")
+        parser.add_argument("--data_patchsize", type=str2bool, default=None, help="input like this 'height_width' : pad - crop - resize - patch: recommand 'A * 2^n'")
         parser.add_argument("--batch_size", type=int, default=None, help="batch_size, if None, searching will be done")
         parser.add_argument("--lossfn", type=str2bool, default='CE', help="class of the loss function[CELoss, DiceCELoss, MSE, ...], see losses.py")
         parser.add_argument("--net_name", type=str2bool, default='smp_unet', help="Class of the Networks, see nets.py")
-        parser.add_argument("--net_inputch", type=int, default=1, help='dimensions of network input channel')
-        parser.add_argument("--net_outputch", type=int, default=2, help='dimensions of network output channel')
-        parser.add_argument("--net_baysian", type=str2bool, default=False, help='Dropout in the Bottleneck')
-        parser.add_argument("--net_norm", type=str2bool, default='batch', help='net normalization, [batch,instance,group]')          
-        parser.add_argument("--net_ckpt", type=str2bool, default=None, help='path to checkpoint, ex) logs/[PROJECT]/[ID]')        
-#         parser.add_argument("--net_nnblock", type=str2bool, default=False, help='nnblock')              
-#         parser.add_argument("--net_supervision", type=str2bool, default=False, help='supervision')      
-#         parser.add_argument("--net_skipatt", type=str2bool, default=False, help='supervision')          
-#         parser.add_argument("--net_rcnn", type=str2bool, default=False, help='supervision')      
-#         parser.add_argument("--net_reconstruction", type=str2bool, default=False, help='supervision')      
-#         parser.add_argument("--net_wavelet", type=str2bool, default=False, help='supervision')        
-#         parser.add_argument("--net_activation", type=str2bool, default='relu', help='activation')     
-        parser.add_argument("--net_encoder_name", type=str, default='resnet50', help='encoder__name')
+        parser.add_argument("--net_inputch", type=int, default=1, help='dimensions of network input channel, see nets.py')
+        parser.add_argument("--net_outputch", type=int, default=2, help='dimensions of network output channel, see nets.py')
+        parser.add_argument("--net_bayesian", type=float, default=0.2, help='Dropout in the Bottleneck, see nets.py')
+        parser.add_argument("--net_norm", type=str2bool, default='batch', help='net normalization, [batch,instance,group], see nets.py')          
+        parser.add_argument("--net_ckpt", type=str2bool, default=None, help='path to checkpoint, ex) logs/[PROJECT]/[ID]')         
+        parser.add_argument("--activation_T", type=int, default=1, help='Temperature of activation')        
+        parser.add_argument("--net_nnblock", type=str2bool, default=False, help='nnblock')              
+        parser.add_argument("--net_rcnn", type=str2bool, default=False, help='net_rcnn')      
+        parser.add_argument("--net_skipatt", type=str2bool, default=False, help='net_skipatt')      
+        parser.add_argument("--net_supervision", type=str2bool, default=False, help='supervision')      
+        parser.add_argument("--net_wavelet", type=str2bool, default=False, help='net_wavelet')        
+        parser.add_argument("--net_encoder_name", type=str, default='resnet50', help='encoder_name of segmentation_model_pytorch')
         parser.add_argument("--precision", type=int, default=32, help='amp will be set when 16 is given')
         parser.add_argument("--lr", type=float, default=1e-3, help="Set learning rate of Adam optimzer.")        
         parser.add_argument("--experiment_name", type=str, default=None, help='Postfix name of experiment')         
@@ -393,7 +401,7 @@ class MyDataModule(pl.LightningDataModule):
 
 
 # wandb image visualization
-segmentation_classes = ['black', 'class1', 'class2', 'class3', 'class4', 'class5']
+segmentation_classes = ['black', 'class1', 'class2', 'class3']
 
 def labels():
     l = {}
@@ -404,7 +412,7 @@ def labels():
 def wb_mask(x, yhat, y, samples=4):
     
     x = torchvision.utils.make_grid(x[:samples].cpu().detach(),normalize=True).permute(1,2,0)
-    y = torchvision.utils.make_grid(y[:samples].cpu().detach()).permute(1,2,0)
+    y = torchvision.utils.make_grid(y[:samples].cpu().detach()).permute(1,2,0).round()
     yhat = torchvision.utils.make_grid(torch.argmax(yhat[:samples],1).unsqueeze(1).cpu()).permute(1,2,0) if yhat.shape[1]>1 else \
            torchvision.utils.make_grid(yhat[:samples].round().cpu()).permute(1,2,0)
 
@@ -458,9 +466,10 @@ def main(args: Namespace):
     print('Current Experiment:',args.experiment_name,'\n','*'*100)
     
     os.makedirs('logs',mode=0o777, exist_ok=True)
-    wb_logger = pl_loggers.WandbLogger(save_dir='logs/', name=args.experiment_name, project=args.project, log_model = "all")
+    wb_logger = pl_loggers.WandbLogger(save_dir='logs/', name=args.experiment_name, project=args.project) #, log_model = "all")
     wb_logger.log_hyperparams(args)
-#     wb_logger.watch(model,log="all", log_freq=10)
+    # wb_logger.watch(model,log="all", log_freq=100)
+    wb_logger.watch(model, log_graph=False)
     Checkpoint_callback = ModelCheckpoint(verbose=True, 
                                           monitor='loss_val',
                                           mode='min',
@@ -476,15 +485,16 @@ def main(args: Namespace):
                                             callbacks=[Checkpoint_callback,
                                                        LearningRateMonitor(),
                                                        StochasticWeightAveraging(),
-                                                       EarlyStopping(monitor='loss_val',patience=200),
+                                                       EarlyStopping(monitor='loss_val', patience=200),
                                                       ],
-                                            deterministic=True,
+                                            # deterministic=True,
+                                            deterministic=False,
                                             gpus = -1,
                                             logger = wb_logger,
                                             log_every_n_steps=1,
                                             max_epochs = 2000,
                                             num_processes = 0,
-                                            stochastic_weight_avg = True,
+                                            # stochastic_weight_avg = True,
                                             sync_batchnorm = True,
                                             weights_summary = 'top', 
                                            )
